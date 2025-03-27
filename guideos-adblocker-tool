@@ -1,0 +1,214 @@
+#!/bin/bash
+#
+# GuideOS-Adblocker by evilware666
+# -------------------------------------------------------
+# Dieses Script bietet:
+#  - Eine Passwortabfrage, um sudo-Rechte zu erhalten.
+#  - Eine Auswahl verschiedener Blocklisten (unter "Eigene Listen" im Aktivierungs-Menü).
+#  - Die Möglichkeit, eigene Domains (Adserver) einzutragen.
+#  - Eine Funktion, um die vorgenommenen Änderungen (an /etc/hosts) rückgängig zu machen.
+#
+# ACHTUNG: Das Script erstellt ein Backup der Original-/etc/hosts unter /etc/hosts.adblocker.bak.
+# Verwende das Script nur, wenn Du Dir der Wirkung bewusst bist.
+
+#############################
+# Globale Variablen
+#############################
+
+CUSTOM_FILE="$HOME/.adblocker_custom"           # Eigene, benutzerdefinierte Einträge
+BACKUP_FILE="/etc/hosts.adblocker.bak"             # Backup der Original-/etc/hosts
+
+# Definition der Blocklisten (Name => URL)
+declare -A BLOCKLISTS
+
+BLOCKLISTS["AdAway (Ursprünglich für Android, blockiert Werbung)"]="https://adaway.org/hosts.txt"
+BLOCKLISTS["PornBlock (Blockiert pornografische Inhalte)"]="https://raw.githubusercontent.com/mitchellkrogza/Ultimate.Hosts.Blacklist/master/hosts.Porn"
+BLOCKLISTS["MalwareDomains (Blockiert Malware-Domains)"]="https://mirror1.malwaredomains.com/files/justdomains"
+BLOCKLISTS["StevenBlack's Hosts (Blockiert Fake-News-Seiten und Glücksspiel)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts"
+BLOCKLISTS["Phishing Army Hosts List (Blockiert Phishing-Domain & Fake-Shops)"]="https://phishing.army/download/phishing_hosts.txt
+"
+#############################
+# Funktionen
+#############################
+
+# Passwortabfrage und Überprüfung der sudo-Rechte
+require_sudo() {
+  SUDO_PASS=$(zenity --password --title="Sudo Passwort eingeben")
+  if [ -z "$SUDO_PASS" ]; then
+      zenity --error --text="Kein Passwort eingegeben. Abbruch."
+      exit 1
+  fi
+  # Test: sudo-Befehl ausführen
+  echo "$SUDO_PASS" | sudo -S echo "Sudo-Rechte erhalten" > /dev/null 2>&1
+  if [ $? -ne 0 ]; then
+      zenity --error --text="Falsches Passwort oder keine sudo-Rechte. Abbruch."
+      exit 1
+  fi
+}
+
+# Hilfsfunktion, um Befehle mit sudo auszuführen
+run_sudo() {
+  echo "$SUDO_PASS" | sudo -S "$@"
+}
+
+# Erstellt ein Backup der aktuellen /etc/hosts, sofern noch nicht vorhanden
+backup_hosts() {
+  if ! sudo test -f "$BACKUP_FILE"; then
+    echo "$SUDO_PASS" | sudo -S cp /etc/hosts "$BACKUP_FILE"
+  fi
+}
+
+# Stellt das ursprüngliche /etc/hosts aus dem Backup wieder her und entfernt benutzerdefinierte Einträge
+restore_hosts() {
+  if sudo test -f "$BACKUP_FILE"; then
+    echo "$SUDO_PASS" | sudo -S cp "$BACKUP_FILE" /etc/hosts
+    # Löscht die benutzerdefinierten Einträge
+    if [ -f "$CUSTOM_FILE" ]; then
+      rm "$CUSTOM_FILE"
+    fi
+    zenity --info --text="Die ursprünglichen Einstellungen wurden wiederhergestellt und eigene Einträge entfernt."
+  else
+    zenity --warning --text="Kein Backup gefunden – Rückgängig machen nicht möglich."
+  fi
+}
+
+# Aktiviert den Adblock, indem die ausgewählten Blocklisten und ggf. eigene Einträge in die Hosts-Datei übernommen werden
+enable_adblock() {
+  backup_hosts
+
+  ORIG_HOSTS=$(sudo cat "$BACKUP_FILE")
+  TEMP_HOSTS=$(mktemp)
+  echo "$ORIG_HOSTS" > "$TEMP_HOSTS"
+
+  BLOCKLIST_OPTIONS=()
+  for key in "${!BLOCKLISTS[@]}"; do
+    DESCRIPTION=""
+    case "$key" in
+      "StevenBlack's Hosts") DESCRIPTION="(Allgemeine Werbung und Tracker)";;
+      "AdAway") DESCRIPTION="(Mobile Werbung)";;
+      "PornBlock") DESCRIPTION="(Pornographische Inhalte)";;
+    esac
+    if [ "$key" == "StevenBlack's Hosts" ]; then
+       BLOCKLIST_OPTIONS+=("TRUE" "$key $DESCRIPTION")
+    else
+       BLOCKLIST_OPTIONS+=("FALSE" "$key $DESCRIPTION")
+    fi
+  done
+
+  # Eigene manuell hinzugefügte Listen aktivierbar machen
+  if [ -f "$CUSTOM_FILE" ]; then
+    BLOCKLIST_OPTIONS+=("TRUE" "Eigene Einträge (benutzerdefiniert)")
+  fi
+
+  SELECTED=$(zenity --list --checklist \
+              --title="Blocklisten auswählen" \
+              --text="Wähle die Blocklisten aus, die verwendet werden sollen:" \
+              --width=600 --height=450 \
+              --column="Auswahl" --column="Blockliste" \
+              "${BLOCKLIST_OPTIONS[@]}" --separator=":")
+
+  if [ -z "$SELECTED" ]; then
+      zenity --error --text="Keine Blocklisten ausgewählt. Abbruch."
+      rm "$TEMP_HOSTS"
+      exit 1
+  fi
+
+  IFS=":" read -ra SELECTED_ARRAY <<< "$SELECTED"
+  for list in "${SELECTED_ARRAY[@]}"; do
+    CLEAN_LIST=$(echo "$list" | sed 's/ (.*)//')
+    URL="${BLOCKLISTS[$CLEAN_LIST]}"
+    if [ -n "$URL" ]; then
+      TEMP_LIST=$(mktemp)
+      curl -s "$URL" -o "$TEMP_LIST"
+      if [ $? -eq 0 ]; then
+         grep -E "^(0\\.0\\.0\\.0|127\\.0\\.1)" "$TEMP_LIST" >> "$TEMP_HOSTS"
+      else
+         zenity --warning --text="Fehler beim Herunterladen von $CLEAN_LIST."
+      fi
+      rm "$TEMP_LIST"
+    elif [ "$CLEAN_LIST" == "Eigene Einträge (benutzerdefiniert)" ]; then
+      cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
+    fi
+  done
+
+  cat "$TEMP_HOSTS" | sudo tee /etc/hosts > /dev/null
+  rm "$TEMP_HOSTS"
+  zenity --info --text="Adblock wurde aktiviert."
+}
+
+# Ermöglicht das Hinzufügen eigener Blockeinträge
+add_custom_entry() {
+  ENTRY=$(zenity --entry --title="Eigene Einträge" \
+           --text="Gib eine Domain ein, die blockiert werden soll (z.B. ads.example.com):")
+  if [ -z "$ENTRY" ]; then
+    zenity --error --text="Kein Eintrag gemacht."
+    return
+  fi
+
+  # Überprüfen, ob der Eintrag bereits existiert
+  if grep -q "0.0.0.0 $ENTRY" "$CUSTOM_FILE"; then
+    zenity --info --text="Eintrag existiert bereits."
+    return
+  fi
+
+  echo "0.0.0.0 $ENTRY" | sudo tee -a /etc/hosts > /dev/null
+  echo "0.0.0.0 $ENTRY" >> "$CUSTOM_FILE"
+  zenity --info --text="Eintrag wurde hinzugefügt."
+}
+
+# Zeigt die aktuell gespeicherten eigenen Einträge an
+manage_custom_entries() {
+  if [ ! -f "$CUSTOM_FILE" ]; then
+    zenity --info --text="Es wurden noch keine eigenen Einträge angelegt."
+    return
+  fi
+  CUSTOM_ENTRIES=$(cat "$CUSTOM_FILE")
+  zenity --info --title="Eigene Einträge" --width=600 --height=450 --text="Aktuelle Einträge:\n$CUSTOM_ENTRIES"
+}
+
+#############################
+# Hauptmenü
+#############################
+
+main_menu() {
+  while true; do
+    ACTION=$(zenity --list --title="Adblocker Menü" \
+             --text="Wähle eine Aktion:" \
+             --width=600 --height=450 \
+             --column="Aktion" \
+             "Adblock aktivieren" \
+             "Eigene Einträge hinzufügen" \
+             "Eigene Einträge anzeigen" \
+             "Adblock deaktivieren (Alle Einstellungen werden rückgängig gemacht.) ⚠️" \
+             "Beenden")
+    case "$ACTION" in
+      "Adblock aktivieren")
+         enable_adblock
+         ;;
+      "Adblock deaktivieren (Alle Einstellungen werden rückgängig gemacht.) ⚠️")
+         restore_hosts
+         ;;
+      "Eigene Einträge hinzufügen")
+         add_custom_entry
+         ;;
+      "Eigene Einträge anzeigen")
+         manage_custom_entries
+         ;;
+      "Beenden")
+         zenity --info --title="⚠️ ACHTUNG" --text="Um die Änderungen zu übernehmen, kann es erforderlich sein, den Browser-Cache zu löschen. In GuideOS wird der Cache von Firefox automatisch beim Schließen des Browsers gelöscht."
+         exit 0
+         ;;
+      *)
+         exit 0
+         ;;
+    esac
+  done
+}
+
+#############################
+# Hauptprogramm
+#############################
+
+require_sudo
+main_menu
+

@@ -1,0 +1,15 @@
+Source: guideos-adblocker-tool
+Section: misc
+Priority: optional
+Maintainer: Actionschnitzel <actionschnitzel@guideos.de>
+Build-Depends: debhelper (>= 9),bash
+Standards-Version: 0.0.1
+Homepage: https://guideos.de
+
+Package: guideos-adblocker-tool
+Architecture: all
+Depends: ${misc:Depends}, bash, zenity
+Replaces: advert-block
+Conflicts: advert-block
+Description: A simple tool to block ads in your browser
+  This tool will install a hosts file that blocks ads in your browser.

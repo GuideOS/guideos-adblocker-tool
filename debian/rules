@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+
+PACKAGE := guideos-adblocker-tool
+
+%:
+	dh $@
+
+override_dh_install:
+	# Erstellen der notwendigen Verzeichnisse
+	mkdir -p debian/$(PACKAGE)/usr/bin
+	mkdir -p debian/$(PACKAGE)/usr/share/icons/hicolor/128x128
+	mkdir -p debian/$(PACKAGE)/usr/share/icons/hicolor/scalable/apps
+	mkdir -p debian/$(PACKAGE)/usr/share/doc/$(PACKAGE)
+
+	# Kopieren der Dateien
+	cp LICENSE debian/$(PACKAGE)/usr/share/doc/$(PACKAGE)/LICENSE
+	cp guideos-adblocker-tool debian/$(PACKAGE)/usr/bin/
+	cp guideos-adblocker-tool.png debian/$(PACKAGE)/usr/share/icons/hicolor/128x128/
+	cp guideos-adblocker-tool.svg debian/$(PACKAGE)/usr/share/icons/hicolor/scalable/apps/
+
+	# Erstellen der .desktop-Datei
+	./create_desktop_files.sh
+
+	# Setzen der Berechtigungen
+	chmod +x debian/$(PACKAGE)/usr/bin/guideos-adblocker-tool
+
+
+	dh_install

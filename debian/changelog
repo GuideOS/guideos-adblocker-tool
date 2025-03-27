@@ -1,0 +1,17 @@
+guideos-adblocker-tool (0.0.3) unstable; urgency=medium
+
+  * Fixed: Displayed Name
+
+ -- Actionschnitzel <actionschnitzel@guideos.de>  Thu, 27 Mar 2025 19:57:32 +0100
+
+guideos-adblocker-tool (0.0.2) unstable; urgency=medium
+
+  * Change: Icon
+
+ -- Actionschnitzel <actionschnitzel@guideos.de>  Sat, 15 Mar 2025 21:47:16 +0100
+
+guideos-adblocker-tool (0.0.1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Actionschnitzel <actionschnitzel@guideos.de>  Fri, 14 Jan 2025 01:25:21 +0100

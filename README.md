@@ -1,2 +1,8 @@
-# guideos-adblocker-tool
-Adblocker
+# Guide-OS-Adblocker
+
+
+### Build DEB
+
+```
+dpkg-source --build ./
+```
