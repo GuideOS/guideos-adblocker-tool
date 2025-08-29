@@ -1,3 +1,9 @@
+guideos-adblocker-tool (1.2) unstable; urgency=medium
+
+  * Full Rewrite
+
+ -- Actionschnitzel <actionschnitzel@guideos.de>  Fri, 29 Aug 2025 16:22:38 -0400
+
 guideos-adblocker-tool (0.0.4) unstable; urgency=medium
 
   * Changed Icons
