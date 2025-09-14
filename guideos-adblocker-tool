@@ -15,7 +15,9 @@
 #               Der Browser-Cache sollte nach Änderungen ggf. geleert werden.
 #
 # -------------------------------------------------------
-
+# System-Theme übernehmen
+GTK_THEME=$(gsettings get org.cinnamon.desktop.interface gtk-theme | tr -d "'")
+export GTK_THEME
 #############################
 # Globale Variablen
 #############################

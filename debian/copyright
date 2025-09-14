@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: guideos-adblocker-tool
-Source: https://gitlab.pgos.net/project-guideos/guideos-adblocker-tool
+Source: https://github.com/GuideOS/guideos-adblocker-tool
 
 Files: *
 Copyright: 2025 evilware666
