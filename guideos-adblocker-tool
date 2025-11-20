@@ -5,8 +5,9 @@
 #               Malware, Phishing und weiteren unerwünschten Inhalten über /etc/hosts.
 #               Unterstützt vordefinierte Blocklisten sowie benutzerdefinierte Einträge
 #               und bietet eine Wiederherstellungsfunktion des Originalzustands.
-# Entwickler  : evilware666
-# Version     : 1.2
+# Entwickler  : evilware666 & Helga
+# Version     : 1.3
+# Änderungen  : Veraltete Listen wurden durch aktuellere und aktiv gepflegte Listen ersetzt
 # Lizenz      : MIT
 #
 # Hinweis     : Erstellt ein Backup der Originaldatei /etc/hosts unter
@@ -28,11 +29,12 @@ BACKUP_FILE="/etc/hosts.adblocker.bak"
 # Definition der Blocklisten (Name => URL)
 declare -A BLOCKLISTS
 
-BLOCKLISTS["AdAway"]="https://adaway.org/hosts.txt"
-BLOCKLISTS["PornBlock"]="https://raw.githubusercontent.com/mitchellkrogza/Ultimate.Hosts.Blacklist/master/hosts.Porn"
-BLOCKLISTS["Ultimate-Hosts-Blacklist"]="https://github.com/Ultimate-Hosts-Blacklist/Ultimate.Hosts.Blacklist/raw/master/hosts"
 BLOCKLISTS["StevenBlack"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts"
+BLOCKLISTS["StevenBlack-Porn"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts"
+BLOCKLISTS["BlocklistProject-Porn"]="https://blocklistproject.github.io/Lists/porn.txt"
 BLOCKLISTS["Phishing Army"]="https://phishing.army/download/phishing_hosts.txt"
+BLOCKLISTS["Ultimate-Hosts-Blacklist"]="https://github.com/Ultimate-Hosts-Blacklist/Ultimate.Hosts.Blacklist/raw/master/hosts"
+
 
 #############################
 # Funktionen
@@ -89,13 +91,15 @@ Jeder Eintrag zeigt auf 0.0.0.0, wodurch die entsprechenden Domains blockiert we
   BLOCKLIST_OPTIONS=()
   for key in "${!BLOCKLISTS[@]}"; do
     DESCRIPTION=""
-    case "$key" in
-      "AdAway") DESCRIPTION="(Werbung blockieren)" ;;
-      "PornBlock") DESCRIPTION="(Pornografische Inhalte)" ;;
-      "Ultimate-Hosts-Blacklist") DESCRIPTION="(Malware, Ransomware, Phishing und anderen Bedrohungen)" ;;
-      "StevenBlack") DESCRIPTION="(Fake-News & Tracker)" ;;
-      "Phishing Army") DESCRIPTION="(Phishing & Fake-Shops)" ;;
-    esac
+
+case "$key" in
+  "Ultimate-Hosts-Blacklist") DESCRIPTION="(Malware, Ransomware, Phishing und andere Bedrohungen)" ;;
+  "StevenBlack") DESCRIPTION="(Fake-News & Tracker)" ;;
+  "StevenBlack-Porn") DESCRIPTION="(Pornografische Inhalte – gepflegt)" ;;
+  "BlocklistProject-Porn") DESCRIPTION="(Pornografische Inhalte – gepflegt)" ;;
+  "Phishing Army") DESCRIPTION="(Phishing & Fake-Shops)" ;;
+esac
+
     BLOCKLIST_OPTIONS+=("FALSE" "$key $DESCRIPTION")
   done
 
