@@ -1,3 +1,10 @@
+guideos-adblocker-tool (2.1) unstable; urgency=medium
+
+  * Outdated and unmaintained blocklists have been replaced by active
+    blocklists.
+
+ -- Actionschnitzel <actionschnitzel@guideos.de>  Thu, 27 Nov 2025 14:59:33 +0100
+
 guideos-adblocker-tool (2.0) unstable; urgency=medium
 
   * Full Rewrite
