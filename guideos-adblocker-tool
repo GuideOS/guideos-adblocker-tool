@@ -6,8 +6,9 @@
 #               Unterstützt vordefinierte Blocklisten sowie benutzerdefinierte Einträge
 #               und bietet eine Wiederherstellungsfunktion des Originalzustands.
 # Entwickler  : evilware666 & Helga
-# Version     : 1.3
+# Version     : 2.1
 # Änderungen  : Veraltete Listen wurden durch aktuellere und aktiv gepflegte Listen ersetzt
+#               Verbesserte Filterung und Hinweise zum Cache-Leeren hinzugefügt
 # Lizenz      : MIT
 #
 # Hinweis     : Erstellt ein Backup der Originaldatei /etc/hosts unter
@@ -69,10 +70,15 @@ restore_hosts() {
     if [ -f "$CUSTOM_FILE" ]; then
       rm "$CUSTOM_FILE"
     fi
-    zenity --info --text="Alle vorgenommenen Einstellungen werden wieder rückgängig gemacht."
+    zenity --info --text="Alle vorgenommenen Einstellungen wurden rückgängig gemacht.\n\n⚠️ Um die Änderungen wirksam zu machen:\n• Browser komplett schließen und neu starten\n• Browser-Cache leeren\n• DNS-Cache leeren mit: sudo systemd-resolve --flush-caches"
   else
     zenity --warning --text="Kein Backup gefunden – Rückgängig machen nicht möglich."
   fi
+}
+
+show_cache_hint() {
+  zenity --info --width=500 --height=200 --title="Wichtiger Hinweis" \
+    --text="Die Änderungen wurden erfolgreich übernommen!\n\n⚠️ Damit die Blockierung wirksam wird, müssen Sie:\n\n• Alle Browser komplett schließen und neu starten\n• Den Browser-Cache leeren\n• Optional: DNS-Cache leeren mit:\n  sudo systemd-resolve --flush-caches\n\nErst dann werden die geblockten Domains nicht mehr erreichbar sein."
 }
 
 enable_adblock() {
@@ -82,7 +88,7 @@ enable_adblock() {
     --text="Beim Aktivieren der Blocklisten werden die ausgewählten Einträge in die Datei /etc/hosts übernommen.
 Jeder Eintrag zeigt auf 0.0.0.0, wodurch die entsprechenden Domains blockiert werden.
 
-⚠️ Hinweis: Die Änderungen gelten systemweit. Damit sie wirksam werden, ggf. den Browser-Cache leeren."
+⚠️ Hinweis: Die Änderungen gelten systemweit. Damit sie wirksam werden, müssen Browser-Caches geleert werden."
 
   ORIG_HOSTS=$(sudo cat "$BACKUP_FILE")
   TEMP_HOSTS=$(mktemp)
@@ -126,19 +132,26 @@ esac
       TEMP_LIST=$(mktemp)
       curl -s "$URL" -o "$TEMP_LIST"
       if [ $? -eq 0 ]; then
-         grep -E "^(0\\.0\\.0\\.0|127\\.0\\.0\\.1)" "$TEMP_LIST" >> "$TEMP_HOSTS"
+         # Verbesserte Filterung - alle gängigen Hosts-Formate erkennen
+         grep -E "^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|::1)" "$TEMP_LIST" | \
+         sed -e 's/^127.0.0.1/0.0.0.0/' -e 's/^::1/0.0.0.0/' | \
+         grep -v "^#" >> "$TEMP_HOSTS"
       else
          zenity --warning --text="Fehler beim Herunterladen von $CLEAN_LIST."
       fi
       rm "$TEMP_LIST"
     elif [ "$CLEAN_LIST" == "Eigene Einträge (benutzerdefiniert)" ]; then
-      cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
+      if [ -f "$CUSTOM_FILE" ]; then
+        cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
+      fi
     fi
   done
 
-  cat "$TEMP_HOSTS" | sudo tee /etc/hosts > /dev/null
+  # Duplikate entfernen und in /etc/hosts schreiben
+  sort -u "$TEMP_HOSTS" | sudo tee /etc/hosts > /dev/null
   rm "$TEMP_HOSTS"
-  zenity --info --text="Blocklisten wurden aktiviert."
+  
+  show_cache_hint
 }
 
 add_custom_entry() {
@@ -147,26 +160,49 @@ add_custom_entry() {
   if [ -z "$ENTRY" ]; then
     return
   fi
-  if grep -q "0.0.0.0 $ENTRY" "$CUSTOM_FILE" 2>/dev/null; then
-    zenity --info --text="Eintrag existiert bereits."
-    return
-  fi
-  echo "0.0.0.0 $ENTRY" | sudo tee -a /etc/hosts > /dev/null
-  echo "0.0.0.0 $ENTRY" >> "$CUSTOM_FILE"
-  zenity --info --text="Eintrag wurde hinzugefügt."
+  
+  # Domain gründlich bereinigen
+  CLEAN_ENTRY=$(echo "$ENTRY" | sed -e 's/^https*:\/\///' -e 's/^ftp:\/\///' -e 's/\/.*$//' -e 's/^www\.//')
+  
+  # Zur Sicherheit beide Varianten blockieren (mit und ohne www)
+  DOMAINS=("www.$CLEAN_ENTRY" "$CLEAN_ENTRY")
+  
+  for DOMAIN in "${DOMAINS[@]}"; do
+    # Überprüfen ob bereits in /etc/hosts vorhanden
+    if ! grep -q "0.0.0.0 $DOMAIN" /etc/hosts; then
+      # Zur aktuellen /etc/hosts hinzufügen
+      echo "0.0.0.0 $DOMAIN" | sudo tee -a /etc/hosts > /dev/null
+      # Zur benutzerdefinierten Datei hinzufügen
+      echo "0.0.0.0 $DOMAIN" >> "$CUSTOM_FILE"
+    fi
+  done
+  
+  # Falschen Eintrag entfernen falls vorhanden
+  sudo sed -i '/0\.0\.0\.0 https:\/\/www\.stern\.de/d' /etc/hosts
+  sed -i '/0\.0\.0\.0 https:\/\/www\.stern\.de/d' "$CUSTOM_FILE"
+  
+  zenity --info --text="✅ Domain '$CLEAN_ENTRY' wurde korrekt hinzugefügt.\n\nEingetragen als:\n• 0.0.0.0 www.$CLEAN_ENTRY\n• 0.0.0.0 $CLEAN_ENTRY\n\n⚠️ JETZT UNBEDINGT:\n• Browser komplett schließen\n• Browser-Cache leeren\n• DNS-Cache leeren mit: sudo systemd-resolve --flush-caches\n• Browser neu starten"
 }
 
 manage_custom_entries() {
-  if [ ! -f "$CUSTOM_FILE" ]; then
+  if [ ! -f "$CUSTOM_FILE" ] || [ ! -s "$CUSTOM_FILE" ]; then
     zenity --info --text="Es wurden noch keine eigenen Einträge angelegt."
     return
   fi
 
   while true; do
+    # Einträge aus der Custom-Datei lesen
+    CUSTOM_ENTRIES=()
+    while IFS= read -r line; do
+      if [ -n "$line" ]; then
+        CUSTOM_ENTRIES+=("$line")
+      fi
+    done < "$CUSTOM_FILE"
+
     SELECTED_ENTRY=$(zenity --list --title="Eigene Einträge bearbeiten" \
       --text="Wähle einen Eintrag zum Bearbeiten oder Löschen aus:" \
       --width=600 --height=450 \
-      --column="Eintrag" $(cat "$CUSTOM_FILE"))
+      --column="Eintrag" "${CUSTOM_ENTRIES[@]}")
 
     if [ -z "$SELECTED_ENTRY" ]; then
       return
@@ -174,24 +210,31 @@ manage_custom_entries() {
 
     ACTION=$(zenity --list --title="Aktion wählen" \
       --text="Was möchtest du mit dem Eintrag tun?" \
+      --width=300 --height=200 \
       --column="Aktion" "Bearbeiten" "Löschen" "Abbrechen")
 
     case "$ACTION" in
       "Bearbeiten")
+        OLD_DOMAIN=$(echo "$SELECTED_ENTRY" | awk '{print $2}')
         NEW_ENTRY=$(zenity --entry --title="Eintrag bearbeiten" \
-          --text="Gib den korrigierten Eintrag ein:" --entry-text="$(echo "$SELECTED_ENTRY" | awk '{print $2}')")
+          --text="Gib den korrigierten Eintrag ein:" --entry-text="$OLD_DOMAIN")
         if [ -n "$NEW_ENTRY" ]; then
-          sudo sed -i "\|$SELECTED_ENTRY|d" /etc/hosts
-          sed -i "\|$SELECTED_ENTRY|d" "$CUSTOM_FILE"
+          # Aus /etc/hosts entfernen
+          sudo sed -i "/$SELECTED_ENTRY/d" /etc/hosts
+          # Aus Custom-Datei entfernen
+          sed -i "/$SELECTED_ENTRY/d" "$CUSTOM_FILE"
+          # Neuen Eintrag hinzufügen
           echo "0.0.0.0 $NEW_ENTRY" | sudo tee -a /etc/hosts > /dev/null
           echo "0.0.0.0 $NEW_ENTRY" >> "$CUSTOM_FILE"
-          zenity --info --text="Eintrag wurde geändert."
+          zenity --info --text="Eintrag wurde geändert.\n\n⚠️ Browser-Cache leeren und Browser neu starten."
         fi
         ;;
       "Löschen")
-        sudo sed -i "\|$SELECTED_ENTRY|d" /etc/hosts
-        sed -i "\|$SELECTED_ENTRY|d" "$CUSTOM_FILE"
-        zenity --info --text="Eintrag wurde gelöscht."
+        # Aus /etc/hosts entfernen
+        sudo sed -i "/$SELECTED_ENTRY/d" /etc/hosts
+        # Aus Custom-Datei entfernen
+        sed -i "/$SELECTED_ENTRY/d" "$CUSTOM_FILE"
+        zenity --info --text="Eintrag wurde gelöscht.\n\n⚠️ Browser-Cache leeren und Browser neu starten."
         ;;
       *)
         return
@@ -217,7 +260,8 @@ main_menu() {
       "Eigene Einträge hinzufügen") add_custom_entry ;;
       "Eigene Einträge verwalten") manage_custom_entries ;;
       "Beenden")
-         zenity --info --title="⚠️ ACHTUNG" --text="Um die Änderungen zu übernehmen, ggf. Browser-Cache löschen."
+         zenity --info --title="⚠️ HINWEIS" --width=500 --height=200 \
+           --text="Vergessen Sie nicht:\n• Browser komplett zu schließen und neu zu starten\n• Browser-Cache zu leeren\n• DNS-Cache mit 'sudo systemd-resolve --flush-caches' zu leeren\n\nErst dann werden alle Änderungen wirksam!"
          exit 0
          ;;
       *) return ;;
