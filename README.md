@@ -25,11 +25,11 @@ Ein Zenity-basiertes Bash-Skript zur zentralen Verwaltung von Werbe-, Malware- u
 1. Skript herunterladen oder in eine Datei speichern, z. B. `guideos-adblocker.sh`.
 2. Ausführbar machen:
    ```bash
-   chmod +x guideos-adblocker.sh
+   chmod +x guideos-adblocker-tool.sh
    ```
 3. Starten:
    ```bash
-   ./guideos-adblocker.sh
+   ./guideos-adblocker-tool.sh
    ```
 
 ## 🛡️ Nutzung
