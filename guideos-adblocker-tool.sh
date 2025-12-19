@@ -29,8 +29,8 @@ declare -A BLOCKLISTS
 BLOCKLISTS["StevenBlack (blockt Pornografie, Social Media, Fake News, Glücksspiel)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts"
 BLOCKLISTS["StevenBlack-Porn (blockt pornografischen Inhalten)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts"
 BLOCKLISTS["BlocklistProject-Porn (blockt pornografischen Inhalten)"]="https://blocklistproject.github.io/Lists/porn.txt"
-BLOCKLISTS["Phishing Army (blockt Phishing-Seiten)"]="https://phishing.army/download/phishing_hosts.txt"
-BLOCKLISTS["Ultimate-Hosts-Blacklist ( blockt Malware, Ransomware, Tracking, Spam, Pornografie, Gewalt, Fake-Shops.)"]="https://github.com/Ultimate-Hosts-Blacklist/Ultimate.Hosts.Blacklist/raw/master/hosts"
+BLOCKLISTS["BlocklistProject-Phishing (blockt Phishing-Seiten)"]="https://blocklistproject.github.io/Lists/phishing.txt"
+
 
 require_sudo() {
   SUDO_PASS=$(zenity --password --title="Sudo Passwort eingeben")
@@ -84,9 +84,7 @@ enable_adblock() {
 
   BLOCKLIST_OPTIONS=()
   for key in "${!BLOCKLISTS[@]}"; do
-    URL="${BLOCKLISTS[$key]}"
     ACTIVE="FALSE"
-    # Prüfen, ob diese Blockliste laut Statusdatei aktiv ist
     if [ -f /etc/hosts.active_lists ] && grep -qw "$key" /etc/hosts.active_lists; then
       ACTIVE="TRUE"
     fi
@@ -94,37 +92,42 @@ enable_adblock() {
   done
 
   if [ -f "$CUSTOM_FILE" ]; then
-    # Eigene Einträge standardmäßig aktiv markieren
     BLOCKLIST_OPTIONS+=("TRUE" "Eigene Einträge (benutzerdefiniert) – Stand: $LAST_UPDATE" "CUSTOM")
   fi
 
   SELECTED_KEYS=$(zenity --list --checklist \
     --title="Blocklisten auswählen" \
     --text="Wähle die Blocklisten aus, die verwendet werden sollen:" \
-    --width=950 --height=450 \
+    --width=950 --height=450\
     --column="Auswahl" --column="Blockliste" --column="Schlüssel" \
     --hide-column=3 --print-column=3 \
     "${BLOCKLIST_OPTIONS[@]}" --separator=":")
 
   IFS=":" read -ra LISTS <<< "$SELECTED_KEYS"
-
-  # Statusdatei neu schreiben
   echo "${LISTS[@]}" | sudo tee /etc/hosts.active_lists >/dev/null
 
   for KEY in "${LISTS[@]}"; do
     case "$KEY" in
-      "CUSTOM")
-        # Eigene Einträge werden unten eingebunden
-        ;;
+      "CUSTOM") ;;
       *)
         URL="${BLOCKLISTS[$KEY]}"
         [ -z "$URL" ] && continue
 
         TMP=$(mktemp)
         if curl -s "$URL" -o "$TMP"; then
-          grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
-            | sed 's/^127\.0\.0\.1/0.0.0.0/' \
-            | grep -v "^#" >> "$TEMP_HOSTS"
+          # Hosts-Format: enthält 0.0.0.0 oder 127.0.0.1
+          if grep -qE "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP"; then
+            grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
+              | sed 's/^127\.0\.0\.1/0.0.0.0/' \
+              | grep -v "^#" >> "$TEMP_HOSTS"
+          else
+            # Domain-Format: jede Zeile ist eine Domain
+            while read -r DOMAIN; do
+              [ -z "$DOMAIN" ] && continue
+              [[ "$DOMAIN" =~ ^# ]] && continue
+              echo "0.0.0.0 $DOMAIN"
+            done < "$TMP" >> "$TEMP_HOSTS"
+          fi
           echo "# GuideOS Adblocker – $KEY" >> "$TEMP_HOSTS"
         fi
         rm "$TMP"
@@ -144,6 +147,7 @@ enable_adblock() {
   sudo systemd-resolve --flush-caches >/dev/null 2>&1
   show_cache_hint
 }
+
 
 add_custom_entry() {
   ENTRY=$(zenity --entry --title="Domain blockieren" \
@@ -227,9 +231,17 @@ update_blocklists() {
 
       TMP=$(mktemp)
       if curl -s "$URL" -o "$TMP"; then
-        grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
-          | sed 's/^127\.0\.0\.1/0.0.0.0/' \
-          | grep -v "^#" >> "$TEMP_HOSTS"
+        if grep -qE "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP"; then
+          grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
+            | sed 's/^127\.0\.0\.1/0.0.0.0/' \
+            | grep -v "^#" >> "$TEMP_HOSTS"
+        else
+          while read -r DOMAIN; do
+            [ -z "$DOMAIN" ] && continue
+            [[ "$DOMAIN" =~ ^# ]] && continue
+            echo "0.0.0.0 $DOMAIN"
+          done < "$TMP" >> "$TEMP_HOSTS"
+        fi
       fi
       rm "$TMP"
 
@@ -247,16 +259,16 @@ update_blocklists() {
     sort -u "$TEMP_HOSTS" | sudo tee /etc/hosts >/dev/null
     rm "$TEMP_HOSTS"
 
-       sudo systemd-resolve --flush-caches >/dev/null 2>&1
+    sudo systemd-resolve --flush-caches >/dev/null 2>&1
     echo "100"; echo "# Aktualisierung abgeschlossen."
 
-    # Zeitstempel speichern – innerhalb der Subshell!
     date +"%Y-%m-%d %H:%M:%S" | sudo tee /etc/hosts.lastupdate >/dev/null
   ) | zenity --progress \
         --title="Blocklisten werden aktualisiert" \
         --text="Bitte warten, die Blocklisten werden aktualisiert..." \
         --percentage=0 --auto-close --width=500
 }
+
 
 main_menu() {
   while true; do
