@@ -1,6 +1,4 @@
-Natürlich – hier ist eine passende **README.md** für dein GuideOS Adblocker‑Skript, klar strukturiert und sofort einsatzbereit:
 
-```markdown
 # GuideOS Adblocker
 
 Ein Zenity-basiertes Bash-Skript zur zentralen Verwaltung von Werbe-, Malware- und Phishing-Domains über die Systemdatei `/etc/hosts`.
