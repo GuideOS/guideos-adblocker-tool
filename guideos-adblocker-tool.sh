@@ -1,0 +1,301 @@
+#!/bin/bash
+#------------------------------------------------------------------------------------
+# Titel       : GuideOS Adblocker
+# Beschreibung: Zenity-basiertes Bash-Skript zur zentralen Verwaltung von Werbe-,
+#               Malware- und Phishing-Domains über die Systemdatei /etc/hosts.
+#               Das Programm kombiniert vordefinierte Blocklisten mit individuellen
+#               Einträgen und bietet eine komfortable Oberfläche zur Aktivierung,
+#               Deaktivierung und Wiederherstellung des Originalzustands.
+#               Ziel ist eine systemweite Verbesserung von Sicherheit, Performance
+#               und Nutzererlebnis durch die Minimierung unerwünschter Inhalte.
+# Entwickler  : evilware666, helga & Copilot
+# Version     : 2.2
+# Lizenz      : MIT
+#
+# Hinweis     : Erstellt automatisch ein Backup der Originaldatei /etc/hosts unter
+#               /etc/hosts.adblocker.bak. Änderungen greifen systemweit und können
+#               den Zugriff auf bestimmte Domains blockieren. Nach Anpassungen
+#               sollte der Browser-Cache geleert werden, um die Wirkung sofort
+#               sichtbar zu machen.
+#
+# -------------------------------------------------------
+
+
+
+CUSTOM_FILE="$HOME/.adblocker_custom"
+BACKUP_FILE="/etc/hosts.adblocker.bak"
+
+declare -A BLOCKLISTS
+BLOCKLISTS["StevenBlack (blockt Pornografie, Social Media, Fake News, Glücksspiel)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts"
+BLOCKLISTS["StevenBlack-Porn (blockt pornografischen Inhalten)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts"
+BLOCKLISTS["BlocklistProject-Porn (blockt pornografischen Inhalten)"]="https://blocklistproject.github.io/Lists/porn.txt"
+BLOCKLISTS["BlocklistProject-Phishing (blockt Phishing-Seiten)"]="https://blocklistproject.github.io/Lists/phishing.txt"
+
+
+require_sudo() {
+  SUDO_PASS=$(zenity --password --title="Sudo Passwort eingeben")
+  [ -z "$SUDO_PASS" ] && exit 1
+  echo "$SUDO_PASS" | sudo -S true >/dev/null 2>&1 || exit 1
+}
+
+backup_hosts() {
+  # Nur sichern, wenn noch kein Backup existiert
+  if ! sudo test -f "$BACKUP_FILE"; then
+    echo "$SUDO_PASS" | sudo -S cp /etc/hosts "$BACKUP_FILE"
+  fi
+}
+
+
+restore_hosts() {
+  if sudo test -f "$BACKUP_FILE"; then
+    echo "$SUDO_PASS" | sudo -S cp "$BACKUP_FILE" /etc/hosts
+    sudo rm -f /etc/hosts.active_lists
+    sudo systemd-resolve --flush-caches >/dev/null 2>&1
+    zenity --info --text="Alle Änderungen wurden zurückgesetzt.\n\nBrowser neu starten."
+  fi
+}
+
+count_custom_entries() {
+  if [ -f "$CUSTOM_FILE" ]; then
+    grep -c "^0.0.0.0 " "$CUSTOM_FILE"
+  else
+    echo 0
+  fi
+}
+
+show_cache_hint() {
+  COUNT=$(count_custom_entries)
+  zenity --info --width=520 --height=260 \
+    --text="Änderungen übernommen.\n\nEigene Domains geblockt: $COUNT\n\nWichtig:\n• Browser schließen\n• Browser neu starten\n• DNS-Cache wurde geleert"
+}
+
+enable_adblock() {
+  backup_hosts
+
+  ORIG_HOSTS=$(sudo cat "$BACKUP_FILE")
+  TEMP_HOSTS=$(mktemp)
+  echo "$ORIG_HOSTS" > "$TEMP_HOSTS"
+
+  # Zeitstempel auslesen
+  LAST_UPDATE="unbekannt"
+  if [ -f /etc/hosts.lastupdate ]; then
+    LAST_UPDATE=$(cat /etc/hosts.lastupdate)
+  fi
+
+  BLOCKLIST_OPTIONS=()
+  for key in "${!BLOCKLISTS[@]}"; do
+    ACTIVE="FALSE"
+    if [ -f /etc/hosts.active_lists ] && grep -qw "$key" /etc/hosts.active_lists; then
+      ACTIVE="TRUE"
+    fi
+    BLOCKLIST_OPTIONS+=("$ACTIVE" "$key – Stand: $LAST_UPDATE" "$key")
+  done
+
+  if [ -f "$CUSTOM_FILE" ]; then
+    BLOCKLIST_OPTIONS+=("TRUE" "Eigene Einträge (benutzerdefiniert) – Stand: $LAST_UPDATE" "CUSTOM")
+  fi
+
+  SELECTED_KEYS=$(zenity --list --checklist \
+    --title="Blocklisten auswählen" \
+    --text="Wähle die Blocklisten aus, die verwendet werden sollen:" \
+    --width=950 --height=450\
+    --column="Auswahl" --column="Blockliste" --column="Schlüssel" \
+    --hide-column=3 --print-column=3 \
+    "${BLOCKLIST_OPTIONS[@]}" --separator=":")
+
+  IFS=":" read -ra LISTS <<< "$SELECTED_KEYS"
+  echo "${LISTS[@]}" | sudo tee /etc/hosts.active_lists >/dev/null
+
+  for KEY in "${LISTS[@]}"; do
+    case "$KEY" in
+      "CUSTOM") ;;
+      *)
+        URL="${BLOCKLISTS[$KEY]}"
+        [ -z "$URL" ] && continue
+
+        TMP=$(mktemp)
+        if curl -s "$URL" -o "$TMP"; then
+          # Hosts-Format: enthält 0.0.0.0 oder 127.0.0.1
+          if grep -qE "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP"; then
+            grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
+              | sed 's/^127\.0\.0\.1/0.0.0.0/' \
+              | grep -v "^#" >> "$TEMP_HOSTS"
+          else
+            # Domain-Format: jede Zeile ist eine Domain
+            while read -r DOMAIN; do
+              [ -z "$DOMAIN" ] && continue
+              [[ "$DOMAIN" =~ ^# ]] && continue
+              echo "0.0.0.0 $DOMAIN"
+            done < "$TMP" >> "$TEMP_HOSTS"
+          fi
+          echo "# GuideOS Adblocker – $KEY" >> "$TEMP_HOSTS"
+        fi
+        rm "$TMP"
+        ;;
+    esac
+  done
+
+  if [ -f "$CUSTOM_FILE" ]; then
+    echo "" >> "$TEMP_HOSTS"
+    echo "# GuideOS Adblocker – Eigene Einträge" >> "$TEMP_HOSTS"
+    cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
+  fi
+
+  sort -u "$TEMP_HOSTS" | sudo tee /etc/hosts >/dev/null
+  rm "$TEMP_HOSTS"
+
+  sudo systemd-resolve --flush-caches >/dev/null 2>&1
+  show_cache_hint
+}
+
+
+add_custom_entry() {
+  ENTRY=$(zenity --entry --title="Domain blockieren" \
+    --text="Domain eingeben (z.B. ads.example.com):")
+  [ -z "$ENTRY" ] && return
+
+  CLEAN=$(echo "$ENTRY" | sed -e 's|https\?://||' -e 's|/.*||' -e 's/^www\.//')
+
+  for D in "$CLEAN" "www.$CLEAN"; do
+    if ! grep -qx "0.0.0.0 $D" "$CUSTOM_FILE" 2>/dev/null; then
+      echo "0.0.0.0 $D" | sudo tee -a /etc/hosts >/dev/null
+      echo "::1 $D" | sudo tee -a /etc/hosts >/dev/null
+      echo "0.0.0.0 $D" >> "$CUSTOM_FILE"
+      echo "::1 $D" >> "$CUSTOM_FILE"
+    fi
+  done
+
+  COUNT=$(count_custom_entries)
+  sudo systemd-resolve --flush-caches >/dev/null 2>&1
+
+  zenity --info --text="Domain gespeichert und sofort geblockt.\n\nAktuell geblockt:\n$COUNT eigene Domains\n\nBrowser bitte neu starten."
+}
+
+manage_custom_entries() {
+  if [ ! -s "$CUSTOM_FILE" ]; then
+    zenity --info --text="Keine eigenen Einträge vorhanden."
+    return
+  fi
+
+  ENTRY_LIST=()
+  while read -r IP DOMAIN; do
+    [ "$IP" = "0.0.0.0" ] && ENTRY_LIST+=("FALSE" "$DOMAIN")
+  done < "$CUSTOM_FILE"
+
+  SELECTED=$(zenity --list --checklist \
+    --title="Eigene Einträge verwalten" \
+    --text="Wähle Domains zum Löschen aus:" \
+    --width=600 --height=450 \
+    --column="Löschen" --column="Domain" \
+    "${ENTRY_LIST[@]}" \
+    --separator="|")
+
+  [ -z "$SELECTED" ] && return
+
+  if ! zenity --question --width=420 \
+    --text="Ausgewählte Domains wirklich löschen?"; then
+    return
+  fi
+
+  IFS="|" read -ra TO_DELETE <<< "$SELECTED"
+
+  for DOMAIN in "${TO_DELETE[@]}"; do
+    # Aus Custom-Datei löschen
+    sed -i "\|^0\.0\.0\.0 $DOMAIN$|d" "$CUSTOM_FILE"
+    sed -i "\|^::1 $DOMAIN$|d" "$CUSTOM_FILE"
+    # Auch aus /etc/hosts löschen
+    echo "$SUDO_PASS" | sudo -S sed -i "\|^0\.0\.0\.0 $DOMAIN$|d" /etc/hosts
+    echo "$SUDO_PASS" | sudo -S sed -i "\|^::1 $DOMAIN$|d" /etc/hosts
+  done
+
+  sudo systemd-resolve --flush-caches >/dev/null 2>&1
+
+  COUNT=$(count_custom_entries)
+  zenity --info --text="Einträge gelöscht.\n\nSeiten sind wieder erreichbar.\n\nAktuell geblockt: $COUNT eigene Domains"
+}
+
+
+update_blocklists() {
+  (
+    echo "10"; echo "# Starte Aktualisierung der Blocklisten..."
+    TEMP_HOSTS=$(mktemp)
+    echo "# GuideOS Adblocker – Basis Hosts" > "$TEMP_HOSTS"
+    echo "" >> "$TEMP_HOSTS"
+
+    COUNT=0
+    TOTAL=${#BLOCKLISTS[@]}
+
+    for key in "${!BLOCKLISTS[@]}"; do
+      URL="${BLOCKLISTS[$key]}"
+      [ -z "$URL" ] && continue
+
+      TMP=$(mktemp)
+      if curl -s "$URL" -o "$TMP"; then
+        if grep -qE "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP"; then
+          grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
+            | sed 's/^127\.0\.0\.1/0.0.0.0/' \
+            | grep -v "^#" >> "$TEMP_HOSTS"
+        else
+          while read -r DOMAIN; do
+            [ -z "$DOMAIN" ] && continue
+            [[ "$DOMAIN" =~ ^# ]] && continue
+            echo "0.0.0.0 $DOMAIN"
+          done < "$TMP" >> "$TEMP_HOSTS"
+        fi
+      fi
+      rm "$TMP"
+
+      COUNT=$((COUNT+1))
+      PROGRESS=$(( (COUNT*90)/TOTAL ))
+      echo "$PROGRESS"; echo "# Aktualisiere: $key"
+    done
+
+    if [ -f "$CUSTOM_FILE" ]; then
+      echo "" >> "$TEMP_HOSTS"
+      echo "# GuideOS Adblocker – Eigene Einträge" >> "$TEMP_HOSTS"
+      cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
+    fi
+
+    sort -u "$TEMP_HOSTS" | sudo tee /etc/hosts >/dev/null
+    rm "$TEMP_HOSTS"
+
+    sudo systemd-resolve --flush-caches >/dev/null 2>&1
+    echo "100"; echo "# Aktualisierung abgeschlossen."
+
+    date +"%Y-%m-%d %H:%M:%S" | sudo tee /etc/hosts.lastupdate >/dev/null
+  ) | zenity --progress \
+        --title="Blocklisten werden aktualisiert" \
+        --text="Bitte warten, die Blocklisten werden aktualisiert..." \
+        --percentage=0 --auto-close --width=500
+}
+
+
+main_menu() {
+  while true; do
+    COUNT=$(count_custom_entries)
+
+    ACTION=$(zenity --list \
+      --title="GuideOS Adblocker" \
+      --text="Eigene Domains geblockt: $COUNT" \
+      --width=520 --height=300 \
+      --column="Aktion" \
+      "Blocklisten aktivieren & deaktivieren" \
+      "Eigene Einträge hinzufügen" \
+      "Eigene Einträge verwalten" \
+      "Beenden")
+
+    case "$ACTION" in
+      "Blocklisten aktivieren & deaktivieren") enable_adblock ;;
+      "Eigene Einträge hinzufügen") add_custom_entry ;;
+      "Eigene Einträge verwalten") manage_custom_entries ;;
+      "Beenden") exit 0 ;;
+    esac
+  done
+}
+
+
+# --- Hauptprogramm ---
+require_sudo
+backup_hosts        # <--- hier einmalig sichern
+update_blocklists
+main_menu
