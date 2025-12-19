@@ -50,8 +50,4 @@ Ein Zenity-basiertes Bash-Skript zur zentralen Verwaltung von Werbe-, Malware- u
 
 ## 📜 Lizenz
 MIT License – frei nutzbar und veränderbar.
-```
 
-Damit hast du eine klare, sofort nutzbare README, die alle wichtigen Punkte abdeckt.  
-
-👉 Soll ich dir auch noch eine **Kurzfassung für die Community-Foren** schreiben, die weniger technisch klingt und eher als Release-Post taugt?
