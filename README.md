@@ -1,5 +1,5 @@
 
-# GuideOS Adblocker
+# GuideOS Adblocker 2.2
 
 Ein Zenity-basiertes Bash-Skript zur zentralen Verwaltung von Werbe-, Malware- und Phishing-Domains über die Systemdatei `/etc/hosts`.
 
