@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=2.11
+Name=Adblocker
+Comment=Adblocker für dein System
+Exec=/bin/guideos-adblocker-tool.py
+Icon=/usr/share/pixmaps/guideos-adblocker-tool.png
+Terminal=false
+Type=Application
+Categories=System;
+StartupNotify=true
+
