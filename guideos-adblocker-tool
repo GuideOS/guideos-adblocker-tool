@@ -1,301 +1,1068 @@
-#!/bin/bash
-#------------------------------------------------------------------------------------
-# Titel       : GuideOS Adblocker
-# Beschreibung: Zenity-basiertes Bash-Skript zur zentralen Verwaltung von Werbe-,
-#               Malware- und Phishing-Domains über die Systemdatei /etc/hosts.
-#               Das Programm kombiniert vordefinierte Blocklisten mit individuellen
-#               Einträgen und bietet eine komfortable Oberfläche zur Aktivierung,
-#               Deaktivierung und Wiederherstellung des Originalzustands.
-#               Ziel ist eine systemweite Verbesserung von Sicherheit, Performance
-#               und Nutzererlebnis durch die Minimierung unerwünschter Inhalte.
-# Entwickler  : evilware666 & Helga
-# Version     : 2.2
-# Lizenz      : MIT
-#
-# Hinweis     : Erstellt automatisch ein Backup der Originaldatei /etc/hosts unter
-#               /etc/hosts.adblocker.bak. Änderungen greifen systemweit und können
-#               den Zugriff auf bestimmte Domains blockieren. Nach Anpassungen
-#               sollte der Browser-Cache geleert werden, um die Wirkung sofort
-#               sichtbar zu machen.
-#
-# -------------------------------------------------------
+#!/usr/bin/env python3
+"""
+GuideOS-Adblocker
+
+Zentrale Verwaltung von Werbe-, Malware- und Phishing-Domains über /etc/hosts.
+Das Programm kombiniert vordefinierte Blocklisten mit individuellen Einträgen.
+
+Entwickler: evilware666, Helga
+Version: 2.6
+Lizenz: MIT
+"""
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Gio
+import subprocess
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+import threading
+import tempfile
+import requests
+import logging
+import traceback
+import sys
+import json
+
+LOG_FILE = os.path.expanduser("~/adblocker_debug.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(threadName)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+    filemode='w'
+)
+log = logging.getLogger("adblocker")
+log.info("=== Adblocker gestartet ===")
+
+def run_privileged(command):
+    """
+    Führt einen Shell-Befehl mit sudo aus.
+    Nutzt das bereits gecachte Passwort (einmalige Eingabe zu Beginn).
+    """
+    log.info(f"run_privileged: {command}")
+    
+    try:
+        # sudo ohne Passwortabfrage (weil wir vorher sudo -v gemacht haben)
+        result = subprocess.run(
+            ['sudo', 'bash', '-c', command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode != 0:
+            log.error(f"Befehl fehlgeschlagen (rc={result.returncode}): {result.stderr}")
+            
+            # Prüfe ob es an fehlenden Rechten liegt
+            if "sudo: a password is required" in result.stderr or "Authentication failure" in result.stderr:
+                log.error("Authentifizierung abgelaufen oder fehlgeschlagen")
+                return 1, "", "AUTH_EXPIRED"
+                
+        return result.returncode, result.stdout, result.stderr
+        
+    except subprocess.TimeoutExpired:
+        log.error(f"Timeout nach 60 Sekunden: {command}")
+        return 1, "", "Timeout"
+    except Exception as e:
+        log.error(f"run_privileged Exception: {e}")
+        return 1, "", str(e)
 
 
+class AdBlockerApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='org.guideos.adblocker',
+                         flags=Gio.ApplicationFlags.FLAGS_NONE)
 
-CUSTOM_FILE="$HOME/.adblocker_custom"
-BACKUP_FILE="/etc/hosts.adblocker.bak"
+        style_manager = Adw.StyleManager.get_default()
+        style_manager.set_color_scheme(Adw.ColorScheme.DEFAULT)
 
-declare -A BLOCKLISTS
-BLOCKLISTS["StevenBlack (blockt Pornografie, Social Media, Fake News, Glücksspiel)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts"
-BLOCKLISTS["StevenBlack-Porn (blockt pornografischen Inhalten)"]="https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts"
-BLOCKLISTS["BlocklistProject-Porn (blockt pornografischen Inhalten)"]="https://blocklistproject.github.io/Lists/porn.txt"
-BLOCKLISTS["BlocklistProject-Phishing (blockt Phishing-Seiten)"]="https://blocklistproject.github.io/Lists/phishing.txt"
+        self.CUSTOM_FILE       = os.path.expanduser("~/.adblocker_custom")
+        self.BACKUP_FILE       = "/etc/hosts.adblocker.bak"
+        self.ACTIVE_LISTS_FILE = "/etc/hosts.active_lists"
+        self.LAST_UPDATE_FILE  = "/etc/hosts.lastupdate"
+        self.USER_LISTS_FILE   = os.path.expanduser("~/.adblocker_user_lists.json")
+        
+        self.main_window = None
+        self.auth_window = None
 
+        # Vordefinierte Blocklisten
+        self.BLOCKLISTS = {
+            "StevenBlack (blockt Pornografie, Social Media, Fake News, Glücksspiel)":
+                "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts",
+            "StevenBlack-Porn (blockt pornografischen Inhalten)":
+                "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts",
+            "BlocklistProject-Porn (blockt pornografischen Inhalten)":
+                "https://blocklistproject.github.io/Lists/porn.txt",
+            "BlocklistProject-Phishing (blockt Phishing-Seiten)":
+                "https://blocklistproject.github.io/Lists/phishing.txt"
+        }
+        
+        # Eigene Blocklisten laden
+        self.user_lists = self.load_user_lists()
 
-require_sudo() {
-  SUDO_PASS=$(zenity --password --title="Sudo Passwort eingeben")
-  [ -z "$SUDO_PASS" ] && exit 1
-  echo "$SUDO_PASS" | sudo -S true >/dev/null 2>&1 || exit 1
-}
+    def load_user_lists(self):
+        """Lädt benutzerdefinierte Blocklisten aus JSON-Datei"""
+        if os.path.exists(self.USER_LISTS_FILE):
+            try:
+                with open(self.USER_LISTS_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                log.error(f"Fehler beim Laden der User-Lists: {e}")
+                return {}
+        return {}
 
-backup_hosts() {
-  # Nur sichern, wenn noch kein Backup existiert
-  if ! sudo test -f "$BACKUP_FILE"; then
-    echo "$SUDO_PASS" | sudo -S cp /etc/hosts "$BACKUP_FILE"
-  fi
-}
+    def save_user_lists(self):
+        """Speichert benutzerdefinierte Blocklisten in JSON-Datei"""
+        try:
+            with open(self.USER_LISTS_FILE, 'w') as f:
+                json.dump(self.user_lists, f, indent=2)
+            log.info("User-Lists gespeichert")
+        except Exception as e:
+            log.error(f"Fehler beim Speichern der User-Lists: {e}")
 
+    def add_user_list(self, name, url):
+        """Fügt eine benutzerdefinierte Blockliste hinzu"""
+        self.user_lists[name] = url
+        self.save_user_lists()
 
-restore_hosts() {
-  if sudo test -f "$BACKUP_FILE"; then
-    echo "$SUDO_PASS" | sudo -S cp "$BACKUP_FILE" /etc/hosts
-    sudo rm -f /etc/hosts.active_lists
-    sudo systemd-resolve --flush-caches >/dev/null 2>&1
-    zenity --info --text="Alle Änderungen wurden zurückgesetzt.\n\nBrowser neu starten."
-  fi
-}
+    def remove_user_list(self, name):
+        """Entfernt eine benutzerdefinierte Blockliste"""
+        if name in self.user_lists:
+            del self.user_lists[name]
+            self.save_user_lists()
 
-count_custom_entries() {
-  if [ -f "$CUSTOM_FILE" ]; then
-    grep -c "^0.0.0.0 " "$CUSTOM_FILE"
-  else
-    echo 0
-  fi
-}
+    def get_all_lists(self):
+        """Gibt alle Blocklisten (vordefiniert + benutzerdefiniert) zurück"""
+        all_lists = self.BLOCKLISTS.copy()
+        all_lists.update(self.user_lists)
+        return all_lists
 
-show_cache_hint() {
-  COUNT=$(count_custom_entries)
-  zenity --info --width=520 --height=260 \
-    --text="Änderungen übernommen.\n\nEigene Domains geblockt: $COUNT\n\nWichtig:\n• Browser schließen\n• Browser neu starten\n• DNS-Cache wurde geleert"
-}
+    def do_activate(self):
+        log.info("do_activate: starte")
+        
+        if self.main_window is not None:
+            log.info("Hauptfenster existiert bereits, bringe es in den Vordergrund")
+            self.main_window.present()
+            return
+        
+        self.authenticate_at_start()
 
-enable_adblock() {
-  backup_hosts
+    def authenticate_at_start(self):
+        if self.auth_window is not None:
+            log.info("Auth-Fenster existiert bereits")
+            return
+        
+        self.auth_window = Gtk.Window()
+        self.auth_window.set_title("Authentifizierung erforderlich")
+        self.auth_window.set_default_size(400, 280)
+        self.auth_window.set_modal(True)
+        self.auth_window.set_application(self)
+        self.auth_window.set_halign(Gtk.Align.CENTER)
+        self.auth_window.set_valign(Gtk.Align.CENTER)
+        
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        main_box.set_margin_top(24)
+        main_box.set_margin_bottom(24)
+        main_box.set_margin_start(24)
+        main_box.set_margin_end(24)
+        
+        icon = Gtk.Image.new_from_icon_name("dialog-password")
+        icon.set_pixel_size(64)
+        main_box.append(icon)
+        
+        label = Gtk.Label()
+        label.set_markup("<b>Administrator-Rechte erforderlich</b>")
+        label.set_margin_top(12)
+        main_box.append(label)
+        
+        desc = Gtk.Label()
+        desc.set_text("Der GuideOS-Adblocker benötigt Administrator-Rechte, um /etc/hosts zu bearbeiten.\n              Bitte geben Sie Ihr Passwort ein.")
+        desc.set_wrap(True)
+        desc.set_margin_top(6)
+        main_box.append(desc)
+        
+        password_entry = Gtk.Entry()
+        password_entry.set_visibility(False)
+        password_entry.set_placeholder_text("Passwort")
+        password_entry.set_margin_top(12)
+        main_box.append(password_entry)
+        
+        status_label = Gtk.Label()
+        status_label.set_margin_top(6)
+        status_label.add_css_class("dim-label")
+        main_box.append(status_label)
+        
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        button_box.set_margin_top(12)
+        button_box.set_halign(Gtk.Align.CENTER)
+        
+        cancel_btn = Gtk.Button(label="Abbrechen")
+        cancel_btn.connect("clicked", lambda x: self.quit())
+        
+        auth_btn = Gtk.Button(label="Authentifizieren")
+        auth_btn.add_css_class("suggested-action")
+        auth_btn.set_sensitive(False)
+        
+        button_box.append(cancel_btn)
+        button_box.append(auth_btn)
+        main_box.append(button_box)
+        
+        self.auth_window.set_child(main_box)
+        
+        def on_password_changed(entry):
+            auth_btn.set_sensitive(len(entry.get_text()) > 0)
+        
+        password_entry.connect("changed", on_password_changed)
+        password_entry.connect("activate", lambda x: do_authenticate())
+        
+        def do_authenticate():
+            password = password_entry.get_text()
+            if not password:
+                return
+            
+            auth_btn.set_sensitive(False)
+            auth_btn.set_label("Überprüfe...")
+            cancel_btn.set_sensitive(False)
+            status_label.set_text("")
+            
+            def auth_worker():
+                try:
+                    proc = subprocess.run(
+                        ['sudo', '-S', '-v'],
+                        input=password,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    
+                    if proc.returncode == 0:
+                        log.info("Authentifizierung erfolgreich")
+                        GLib.idle_add(auth_success)
+                    else:
+                        log.error(f"Authentifizierung fehlgeschlagen: {proc.stderr}")
+                        GLib.idle_add(auth_failed, "Falsches Passwort oder keine Berechtigung")
+                        
+                except Exception as e:
+                    log.error(f"Auth Exception: {e}")
+                    GLib.idle_add(auth_failed, str(e))
+            
+            def auth_success():
+                if self.auth_window:
+                    self.auth_window.close()
+                    self.auth_window = None
+                self.show_main_window()
+            
+            def auth_failed(error_msg):
+                status_label.set_text(f"❌ {error_msg}")
+                status_label.add_css_class("error")
+                auth_btn.set_sensitive(True)
+                auth_btn.set_label("Authentifizieren")
+                cancel_btn.set_sensitive(True)
+                password_entry.set_text("")
+                password_entry.grab_focus()
+            
+            threading.Thread(target=auth_worker, daemon=True).start()
+        
+        auth_btn.connect("clicked", lambda x: do_authenticate())
+        
+        self.auth_window.present()
+        password_entry.grab_focus()
 
-  ORIG_HOSTS=$(sudo cat "$BACKUP_FILE")
-  TEMP_HOSTS=$(mktemp)
-  echo "$ORIG_HOSTS" > "$TEMP_HOSTS"
+    def show_main_window(self):
+        log.info("show_main_window: erstelle Fenster")
+        
+        if self.main_window is not None:
+            log.info("Hauptfenster existiert bereits, bringe es in den Vordergrund")
+            self.main_window.present()
+            return
+        
+        self.main_window = AdBlockerWindow(application=self)
+        
+        def backup_worker():
+            if not os.path.exists(self.BACKUP_FILE):
+                log.info("backup_worker: erstelle Backup via sudo")
+                run_privileged(f'cp /etc/hosts {self.BACKUP_FILE}')
+                log.info("backup_worker: Backup fertig")
+            else:
+                log.info("backup_worker: Backup existiert bereits")
 
-  # Zeitstempel auslesen
-  LAST_UPDATE="unbekannt"
-  if [ -f /etc/hosts.lastupdate ]; then
-    LAST_UPDATE=$(cat /etc/hosts.lastupdate)
-  fi
+        t = threading.Thread(target=backup_worker, name="BackupThread", daemon=True)
+        t.start()
+        
+        self.main_window.present()
+        log.info("show_main_window: present() aufgerufen")
 
-  BLOCKLIST_OPTIONS=()
-  for key in "${!BLOCKLISTS[@]}"; do
-    ACTIVE="FALSE"
-    if [ -f /etc/hosts.active_lists ] && grep -qw "$key" /etc/hosts.active_lists; then
-      ACTIVE="TRUE"
-    fi
-    BLOCKLIST_OPTIONS+=("$ACTIVE" "$key – Stand: $LAST_UPDATE" "$key")
-  done
-
-  if [ -f "$CUSTOM_FILE" ]; then
-    BLOCKLIST_OPTIONS+=("TRUE" "Eigene Einträge (benutzerdefiniert) – Stand: $LAST_UPDATE" "CUSTOM")
-  fi
-
-  SELECTED_KEYS=$(zenity --list --checklist \
-    --title="Blocklisten auswählen" \
-    --text="Wähle die Blocklisten aus, die verwendet werden sollen:" \
-    --width=950 --height=450\
-    --column="Auswahl" --column="Blockliste" --column="Schlüssel" \
-    --hide-column=3 --print-column=3 \
-    "${BLOCKLIST_OPTIONS[@]}" --separator=":")
-
-  IFS=":" read -ra LISTS <<< "$SELECTED_KEYS"
-  echo "${LISTS[@]}" | sudo tee /etc/hosts.active_lists >/dev/null
-
-  for KEY in "${LISTS[@]}"; do
-    case "$KEY" in
-      "CUSTOM") ;;
-      *)
-        URL="${BLOCKLISTS[$KEY]}"
-        [ -z "$URL" ] && continue
-
-        TMP=$(mktemp)
-        if curl -s "$URL" -o "$TMP"; then
-          # Hosts-Format: enthält 0.0.0.0 oder 127.0.0.1
-          if grep -qE "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP"; then
-            grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
-              | sed 's/^127\.0\.0\.1/0.0.0.0/' \
-              | grep -v "^#" >> "$TEMP_HOSTS"
-          else
-            # Domain-Format: jede Zeile ist eine Domain
-            while read -r DOMAIN; do
-              [ -z "$DOMAIN" ] && continue
-              [[ "$DOMAIN" =~ ^# ]] && continue
-              echo "0.0.0.0 $DOMAIN"
-            done < "$TMP" >> "$TEMP_HOSTS"
-          fi
-          echo "# GuideOS Adblocker – $KEY" >> "$TEMP_HOSTS"
-        fi
-        rm "$TMP"
-        ;;
-    esac
-  done
-
-  if [ -f "$CUSTOM_FILE" ]; then
-    echo "" >> "$TEMP_HOSTS"
-    echo "# GuideOS Adblocker – Eigene Einträge" >> "$TEMP_HOSTS"
-    cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
-  fi
-
-  sort -u "$TEMP_HOSTS" | sudo tee /etc/hosts >/dev/null
-  rm "$TEMP_HOSTS"
-
-  sudo systemd-resolve --flush-caches >/dev/null 2>&1
-  show_cache_hint
-}
-
-
-add_custom_entry() {
-  ENTRY=$(zenity --entry --title="Domain blockieren" \
-    --text="Domain eingeben (z.B. ads.example.com):")
-  [ -z "$ENTRY" ] && return
-
-  CLEAN=$(echo "$ENTRY" | sed -e 's|https\?://||' -e 's|/.*||' -e 's/^www\.//')
-
-  for D in "$CLEAN" "www.$CLEAN"; do
-    if ! grep -qx "0.0.0.0 $D" "$CUSTOM_FILE" 2>/dev/null; then
-      echo "0.0.0.0 $D" | sudo tee -a /etc/hosts >/dev/null
-      echo "::1 $D" | sudo tee -a /etc/hosts >/dev/null
-      echo "0.0.0.0 $D" >> "$CUSTOM_FILE"
-      echo "::1 $D" >> "$CUSTOM_FILE"
-    fi
-  done
-
-  COUNT=$(count_custom_entries)
-  sudo systemd-resolve --flush-caches >/dev/null 2>&1
-
-  zenity --info --text="Domain gespeichert und sofort geblockt.\n\nAktuell geblockt:\n$COUNT eigene Domains\n\nBrowser bitte neu starten."
-}
-
-manage_custom_entries() {
-  if [ ! -s "$CUSTOM_FILE" ]; then
-    zenity --info --text="Keine eigenen Einträge vorhanden."
-    return
-  fi
-
-  ENTRY_LIST=()
-  while read -r IP DOMAIN; do
-    [ "$IP" = "0.0.0.0" ] && ENTRY_LIST+=("FALSE" "$DOMAIN")
-  done < "$CUSTOM_FILE"
-
-  SELECTED=$(zenity --list --checklist \
-    --title="Eigene Einträge verwalten" \
-    --text="Wähle Domains zum Löschen aus:" \
-    --width=600 --height=450 \
-    --column="Löschen" --column="Domain" \
-    "${ENTRY_LIST[@]}" \
-    --separator="|")
-
-  [ -z "$SELECTED" ] && return
-
-  if ! zenity --question --width=420 \
-    --text="Ausgewählte Domains wirklich löschen?"; then
-    return
-  fi
-
-  IFS="|" read -ra TO_DELETE <<< "$SELECTED"
-
-  for DOMAIN in "${TO_DELETE[@]}"; do
-    # Aus Custom-Datei löschen
-    sed -i "\|^0\.0\.0\.0 $DOMAIN$|d" "$CUSTOM_FILE"
-    sed -i "\|^::1 $DOMAIN$|d" "$CUSTOM_FILE"
-    # Auch aus /etc/hosts löschen
-    echo "$SUDO_PASS" | sudo -S sed -i "\|^0\.0\.0\.0 $DOMAIN$|d" /etc/hosts
-    echo "$SUDO_PASS" | sudo -S sed -i "\|^::1 $DOMAIN$|d" /etc/hosts
-  done
-
-  sudo systemd-resolve --flush-caches >/dev/null 2>&1
-
-  COUNT=$(count_custom_entries)
-  zenity --info --text="Einträge gelöscht.\n\nSeiten sind wieder erreichbar.\n\nAktuell geblockt: $COUNT eigene Domains"
-}
-
-
-update_blocklists() {
-  (
-    echo "10"; echo "# Starte Aktualisierung der Blocklisten..."
-    TEMP_HOSTS=$(mktemp)
-    echo "# GuideOS Adblocker – Basis Hosts" > "$TEMP_HOSTS"
-    echo "" >> "$TEMP_HOSTS"
-
-    COUNT=0
-    TOTAL=${#BLOCKLISTS[@]}
-
-    for key in "${!BLOCKLISTS[@]}"; do
-      URL="${BLOCKLISTS[$key]}"
-      [ -z "$URL" ] && continue
-
-      TMP=$(mktemp)
-      if curl -s "$URL" -o "$TMP"; then
-        if grep -qE "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP"; then
-          grep -E "^(0\.0\.0\.0|127\.0\.0\.1|::1)" "$TMP" \
-            | sed 's/^127\.0\.0\.1/0.0.0.0/' \
-            | grep -v "^#" >> "$TEMP_HOSTS"
-        else
-          while read -r DOMAIN; do
-            [ -z "$DOMAIN" ] && continue
-            [[ "$DOMAIN" =~ ^# ]] && continue
-            echo "0.0.0.0 $DOMAIN"
-          done < "$TMP" >> "$TEMP_HOSTS"
-        fi
-      fi
-      rm "$TMP"
-
-      COUNT=$((COUNT+1))
-      PROGRESS=$(( (COUNT*90)/TOTAL ))
-      echo "$PROGRESS"; echo "# Aktualisiere: $key"
-    done
-
-    if [ -f "$CUSTOM_FILE" ]; then
-      echo "" >> "$TEMP_HOSTS"
-      echo "# GuideOS Adblocker – Eigene Einträge" >> "$TEMP_HOSTS"
-      cat "$CUSTOM_FILE" >> "$TEMP_HOSTS"
-    fi
-
-    sort -u "$TEMP_HOSTS" | sudo tee /etc/hosts >/dev/null
-    rm "$TEMP_HOSTS"
-
-    sudo systemd-resolve --flush-caches >/dev/null 2>&1
-    echo "100"; echo "# Aktualisierung abgeschlossen."
-
-    date +"%Y-%m-%d %H:%M:%S" | sudo tee /etc/hosts.lastupdate >/dev/null
-  ) | zenity --progress \
-        --title="Blocklisten werden aktualisiert" \
-        --text="Bitte warten, die Blocklisten werden aktualisiert..." \
-        --percentage=0 --auto-close --width=500
-}
+    def show_error(self, title, message):
+        temp_window = Gtk.Window()
+        temp_window.set_application(self)
+        temp_window.present()
+        dialog = Adw.AlertDialog(heading=title, body=message)
+        dialog.add_response("ok", "OK")
+        def on_response(dialog, response):
+            temp_window.close()
+        dialog.connect("response", on_response)
+        dialog.present(temp_window)
 
 
-main_menu() {
-  while true; do
-    COUNT=$(count_custom_entries)
+class AdBlockerWindow(Adw.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
-    ACTION=$(zenity --list \
-      --title="GuideOS Adblocker" \
-      --text="Eigene Domains geblockt: $COUNT" \
-      --width=520 --height=300 \
-      --column="Aktion" \
-      "Blocklisten aktivieren & deaktivieren" \
-      "Eigene Einträge hinzufügen" \
-      "Eigene Einträge verwalten" \
-      "Beenden")
+        self.app = self.get_application()
+        self.set_default_size(600, 630)
+        self.set_title("GuideOS-Adblocker")
 
-    case "$ACTION" in
-      "Blocklisten aktivieren & deaktivieren") enable_adblock ;;
-      "Eigene Einträge hinzufügen") add_custom_entry ;;
-      "Eigene Einträge verwalten") manage_custom_entries ;;
-      "Beenden") exit 0 ;;
-    esac
-  done
-}
+        header = Adw.HeaderBar()
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        main_box.set_spacing(0)
+
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(main_box)
+        self.set_content(toolbar_view)
+
+        # ── Info-Bereich ──────────────────────────────────────────────
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        info_box.set_margin_top(12)
+        info_box.set_margin_bottom(6)
+        info_box.set_margin_start(12)
+        info_box.set_margin_end(12)
+
+        title_label = Gtk.Label()
+        title_label.set_markup("<b>Befreie dich von Werbung und schütze deine Privatsphäre!</b>")
+        title_label.set_xalign(0.5)
+        info_box.append(title_label)
+
+        explanation = Gtk.Label()
+        explanation.set_markup("<small>Der GuideOS-Adblocker blockiert Werbung sowie schädliche Webseiten und das alles systemweit.</small>")
+        explanation.set_xalign(0.5)
+        explanation.set_margin_top(4)
+        explanation.add_css_class("dim-label")
+        info_box.append(explanation)
+
+        self.custom_count_label = Gtk.Label()
+        self.custom_count_label.set_xalign(0.5)
+        self.custom_count_label.set_margin_top(6)
+        self.update_custom_count()
+        info_box.append(self.custom_count_label)
+
+        self.update_status_label = Gtk.Label()
+        self.update_status_label.set_xalign(0.5)
+        self.update_status_label.set_margin_top(4)
+        self.update_status_label.set_margin_bottom(2)
+        self.refresh_update_status_label()
+        info_box.append(self.update_status_label)
+
+        main_box.append(info_box)
+
+        separator = Gtk.Separator()
+        separator.set_margin_top(12)
+        separator.set_margin_bottom(12)
+        main_box.append(separator)
+
+        # ── Buttons ───────────────────────────────────────────────────
+        button_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        button_box.set_spacing(12)
+        button_box.set_margin_top(12)
+        button_box.set_margin_bottom(12)
+        button_box.set_margin_start(24)
+        button_box.set_margin_end(24)
+        button_box.set_halign(Gtk.Align.CENTER)
+        button_box.set_valign(Gtk.Align.CENTER)
+
+        btn_enable = Gtk.Button(label="📋 Blocklisten verwalten")
+        btn_enable.set_size_request(400, 50)
+        btn_enable.set_tooltip_text("Vordefinierte Listen aktivieren/deaktivieren")
+        btn_enable.connect("clicked", self.on_enable_blocklists)
+        button_box.append(btn_enable)
+
+        btn_add = Gtk.Button(label="🚫 Webseite blockieren")
+        btn_add.set_size_request(400, 50)
+        btn_add.set_tooltip_text("Einzelne Webseite zur Sperrliste hinzufügen")
+        btn_add.connect("clicked", self.on_add_custom_entry)
+        button_box.append(btn_add)
+
+        btn_manage = Gtk.Button(label="📝 Gesperrte Seiten verwalten")
+        btn_manage.set_size_request(400, 50)
+        btn_manage.set_tooltip_text("Eigene Einträge ansehen und löschen")
+        btn_manage.connect("clicked", self.on_manage_custom_entries)
+        button_box.append(btn_manage)
+
+        btn_update = Gtk.Button(label="🔄 Listen aktualisieren")
+        btn_update.set_size_request(400, 50)
+        btn_update.set_tooltip_text("Blocklisten auf neuesten Stand bringen")
+        btn_update.connect("clicked", self.on_update_blocklists)
+        button_box.append(btn_update)
+
+        btn_manage_lists = Gtk.Button(label="➕ Eigene Blocklisten verwalten")
+        btn_manage_lists.set_size_request(400, 50)
+        btn_manage_lists.set_tooltip_text("Eigene Blocklisten hinzufügen oder entfernen")
+        btn_manage_lists.connect("clicked", self.on_manage_user_lists)
+        button_box.append(btn_manage_lists)
+
+        btn_reset = Gtk.Button(label="↩️ Alles zurücksetzen")
+        btn_reset.set_size_request(400, 50)
+        btn_reset.add_css_class("destructive-action")
+        btn_reset.set_tooltip_text("Alle Blockierungen entfernen")
+        btn_reset.connect("clicked", self.on_restore_hosts)
+        button_box.append(btn_reset)
+
+        btn_quit = Gtk.Button(label="❌ Beenden")
+        btn_quit.set_size_request(400, 50)
+        btn_quit.set_tooltip_text("Programm schließen")
+        btn_quit.connect("clicked", lambda x: self.close())
+        button_box.append(btn_quit)
+
+        main_box.append(button_box)
+
+        hint = Gtk.Label()
+        hint.set_markup("<small>💡 <b>Tipp:</b> Nach Änderungen Browser neu starten!</small>")
+        hint.set_margin_top(12)
+        hint.set_margin_bottom(12)
+        hint.add_css_class("dim-label")
+        main_box.append(hint)
+
+        GLib.timeout_add(500, self.auto_update_on_start)
+
+    # ── Hilfsmethoden ─────────────────────────────────────────────────
+
+    def update_custom_count(self):
+        count = self.count_custom_entries()
+        self.custom_count_label.set_text(f"Eigene Domains geblockt: {count}")
+
+    def refresh_update_status_label(self):
+        if os.path.exists(self.app.LAST_UPDATE_FILE):
+            try:
+                with open(self.app.LAST_UPDATE_FILE, 'r') as f:
+                    ts = f.read().strip()
+                dt    = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                datum = dt.strftime("%d.%m.%Y %H:%M")
+                self.update_status_label.set_markup(
+                    f'<span foreground="green">✔ Blocklisten aktualisiert ({datum})</span>'
+                )
+            except Exception:
+                self.update_status_label.set_markup(
+                    '<span foreground="red">⚠ Bitte aktualisiere die Blocklisten</span>'
+                )
+        else:
+            self.update_status_label.set_markup(
+                '<span foreground="red">⚠ Bitte aktualisiere die Blocklisten</span>'
+            )
+
+    def count_custom_entries(self):
+        if os.path.exists(self.app.CUSTOM_FILE):
+            try:
+                with open(self.app.CUSTOM_FILE, 'r') as f:
+                    return sum(1 for line in f if line.startswith("0.0.0.0 "))
+            except:
+                return 0
+        return 0
+
+    def show_info(self, title, message):
+        dialog = Adw.AlertDialog(heading=title, body=message)
+        dialog.add_response("ok", "OK")
+        dialog.set_default_response("ok")
+        dialog.present(self)
+
+    # ── Update-Logik ──────────────────────────────────────────────────
+
+    def auto_update_on_start(self):
+        log.info("auto_update_on_start: starte Hintergrund-Thread")
+        self.start_update_thread()
+        return False
+
+    def on_update_blocklists(self, button):
+        log.info("on_update_blocklists: manuell ausgelöst")
+        self.start_update_thread()
+
+    def start_update_thread(self):
+        def worker():
+            log.info("worker: gestartet")
+            try:
+                self.do_update()
+                log.info("worker: do_update fertig")
+            except Exception:
+                log.error(f"worker: EXCEPTION:\n{traceback.format_exc()}")
+            GLib.idle_add(self.refresh_update_status_label)
+            GLib.idle_add(self.update_custom_count)
+            log.info("worker: idle_add gesetzt – Thread endet")
+
+        t = threading.Thread(target=worker, name="UpdateThread", daemon=True)
+        t.start()
+        log.info(f"start_update_thread: gestartet id={t.ident}")
+
+    def do_update(self):
+        log.info("do_update: lese active_lists")
+        active_lists = []
+        if os.path.exists(self.app.ACTIVE_LISTS_FILE):
+            with open(self.app.ACTIVE_LISTS_FILE, 'r') as f:
+                active_lists = [l.strip() for l in f if l.strip()]
+        log.info(f"do_update: active_lists={active_lists}")
+
+        all_lists = self.app.get_all_lists()
+        has_lists  = any(k in active_lists for k in all_lists)
+        has_custom = "CUSTOM" in active_lists and os.path.exists(self.app.CUSTOM_FILE)
+
+        if not has_lists and not has_custom:
+            log.info("do_update: keine aktiven Listen – nichts zu tun")
+            return
+
+        tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.hosts')
+        log.info(f"do_update: temp-Datei: {tmp.name}")
+
+        with open(self.app.BACKUP_FILE, 'r') as f:
+            tmp.write(f.read())
+        tmp.write(f"\n# Blocklisten – Aktualisiert am {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+        for key in all_lists:
+            if key not in active_lists:
+                continue
+            url = all_lists[key]
+            log.info(f"do_update: lade '{key}'")
+            try:
+                resp    = requests.get(url, timeout=30)
+                content = resp.text
+                log.info(f"do_update: '{key}' OK ({len(content)} Zeichen)")
+                if re.search(r'^(0\.0\.0\.0|127\.0\.0\.1|::1)', content, re.MULTILINE):
+                    for line in content.splitlines():
+                        if re.match(r'^(0\.0\.0\.0|127\.0\.0\.1|::1)', line):
+                            line = re.sub(r'^127\.0\.0\.1', '0.0.0.0', line)
+                            if not line.startswith('#'):
+                                tmp.write(line + '\n')
+                else:
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            tmp.write(f"0.0.0.0 {line}\n")
+            except Exception as e:
+                log.error(f"do_update: Fehler bei '{key}': {e}")
+
+        if has_custom:
+            log.info("do_update: füge Custom-Einträge hinzu")
+            tmp.write("\n# GuideOS-Adblocker – Eigene Einträge\n")
+            with open(self.app.CUSTOM_FILE, 'r') as f:
+                tmp.write(f.read())
+
+        tmp.close()
+
+        log.info("do_update: schreibe /etc/hosts via sudo")
+        rc, _, err = run_privileged(f'sort -u {tmp.name} > /etc/hosts')
+        if rc != 0:
+            if err == "AUTH_EXPIRED":
+                log.error("Authentifizierung abgelaufen")
+                GLib.idle_add(self.show_info, "Authentifizierung erforderlich", 
+                            "Die sudo-Session ist abgelaufen. Bitte starten Sie das Programm neu.")
+            else:
+                log.error(f"do_update: /etc/hosts schreiben fehlgeschlagen: {err}")
+                GLib.idle_add(self.show_info, "Fehler", f"Konnte /etc/hosts nicht aktualisieren:\n{err}")
+        os.unlink(tmp.name)
+
+        log.info("do_update: flush DNS")
+        run_privileged('systemd-resolve --flush-caches 2>/dev/null || resolvectl flush-caches 2>/dev/null || true')
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts_tmp = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        ts_tmp.write(timestamp)
+        ts_tmp.close()
+        run_privileged(f'mv {ts_tmp.name} {self.app.LAST_UPDATE_FILE}')
+        log.info(f"do_update: fertig – {timestamp}")
+
+    # ── Button-Handler ────────────────────────────────────────────────
+
+    def on_enable_blocklists(self, button):
+        BlocklistDialog(self).present()
+
+    def on_manage_user_lists(self, button):
+        ManageUserListsDialog(self).present()
+
+    def on_add_custom_entry(self, button):
+        dialog = Adw.AlertDialog(
+            heading="Webseite blockieren",
+            body="Geben Sie die Webadresse ein (z.B. facebook.com):"
+        )
+        dialog.add_response("cancel", "Abbrechen")
+        dialog.add_response("ok", "Blockieren")
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("ok")
+
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("z.B. facebook.com")
+        entry.set_margin_top(12)
+        entry.set_margin_bottom(12)
+        entry.set_margin_start(12)
+        entry.set_margin_end(12)
+
+        def do_block():
+            domain = entry.get_text().strip()
+            if domain:
+                dialog.close()
+                self.add_custom_domain(domain)
+
+        entry.connect("activate", lambda e: do_block())
+        dialog.set_extra_child(entry)
+
+        def on_response(d, response):
+            if response == "ok":
+                do_block()
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+        GLib.timeout_add(100, lambda: (entry.grab_focus(), False)[1])
+
+    def add_custom_domain(self, domain):
+        domain = re.sub(r'https?://', '', domain)
+        domain = re.sub(r'/.*', '', domain)
+        domain = re.sub(r'^www\.', '', domain)
+
+        domains_to_add = [domain, f"www.{domain}"]
+
+        if not os.path.exists(self.app.CUSTOM_FILE):
+            Path(self.app.CUSTOM_FILE).touch()
+
+        existing = set()
+        with open(self.app.CUSTOM_FILE, 'r') as f:
+            for line in f:
+                if line.startswith("0.0.0.0 "):
+                    existing.add(line.strip().split()[1])
+
+        for d in domains_to_add:
+            if d not in existing:
+                with open(self.app.CUSTOM_FILE, 'a') as f:
+                    f.write(f"0.0.0.0 {d}\n")
+                    f.write(f"::1 {d}\n")
+                run_privileged(f'echo "0.0.0.0 {d}" >> /etc/hosts')
+                run_privileged(f'echo "::1 {d}" >> /etc/hosts')
+
+        run_privileged('systemd-resolve --flush-caches 2>/dev/null || resolvectl flush-caches 2>/dev/null || true')
+        self.update_custom_count()
+
+        count = self.count_custom_entries()
+        self.show_info(
+            "Webseite blockiert ✓",
+            f"{domain} wurde gesperrt.\n\nGesperrt: {count} Webseiten\n\nBrowser bitte neu starten!"
+        )
+
+    def on_manage_custom_entries(self, button):
+        if not os.path.exists(self.app.CUSTOM_FILE) or os.path.getsize(self.app.CUSTOM_FILE) == 0:
+            self.show_info("Keine Einträge", "Noch keine eigenen Webseiten gesperrt.")
+            return
+        ManageCustomDialog(self).present()
+
+    def on_restore_hosts(self, button):
+        dialog = Adw.AlertDialog(
+            heading="Wirklich alles zurücksetzen?",
+            body="ALLE Blockierungen werden entfernt!\n\nFortfahren?"
+        )
+        dialog.add_response("cancel", "Abbrechen")
+        dialog.add_response("restore", "Ja, zurücksetzen")
+        dialog.set_response_appearance("restore", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+
+        def on_response(d, response):
+            if response == "restore":
+                self.restore_hosts()
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def restore_hosts(self):
+        if os.path.exists(self.app.BACKUP_FILE):
+            run_privileged(f'cp {self.app.BACKUP_FILE} /etc/hosts')
+            run_privileged(f'rm -f {self.app.ACTIVE_LISTS_FILE}')
+            run_privileged('systemd-resolve --flush-caches 2>/dev/null || resolvectl flush-caches 2>/dev/null || true')
+            self.update_custom_count()
+            self.refresh_update_status_label()
+            self.show_info("Zurückgesetzt ✓", "Alle Blockierungen entfernt.\n\nBrowser neu starten!")
 
 
-# --- Hauptprogramm ---
-require_sudo
-backup_hosts        # <--- hier einmalig sichern
-update_blocklists
-main_menu
+class BlocklistDialog(Adw.Window):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent_window = parent
+        self.app = parent.app
+
+        self.set_title("Blocklisten verwalten")
+        self.set_default_size(950, 450)
+        self.set_transient_for(parent)
+        self.set_modal(True)
+
+        header = Adw.HeaderBar()
+
+        cancel_btn = Gtk.Button(label="Abbrechen")
+        cancel_btn.connect("clicked", lambda x: self.close())
+        header.pack_start(cancel_btn)
+
+        apply_btn = Gtk.Button(label="Anwenden")
+        apply_btn.add_css_class("suggested-action")
+        apply_btn.set_tooltip_text("Auswahl speichern")
+        apply_btn.connect("clicked", self.on_apply)
+        header.pack_end(apply_btn)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(main_box)
+        self.set_content(toolbar_view)
+
+        info_label = Gtk.Label()
+        info_label.set_markup("<b>Wählen Sie die Blocklisten aus:</b>")
+        info_label.set_xalign(0)
+        info_label.set_margin_top(12)
+        info_label.set_margin_bottom(12)
+        info_label.set_margin_start(12)
+        info_label.set_margin_end(12)
+        main_box.append(info_label)
+
+        last_update = "unbekannt"
+        if os.path.exists(self.app.LAST_UPDATE_FILE):
+            with open(self.app.LAST_UPDATE_FILE, 'r') as f:
+                last_update = f.read().strip()
+
+        active_lists = []
+        if os.path.exists(self.app.ACTIVE_LISTS_FILE):
+            with open(self.app.ACTIVE_LISTS_FILE, 'r') as f:
+                active_lists = [l.strip() for l in f if l.strip()]
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+
+        list_box = Gtk.ListBox()
+        list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        list_box.add_css_class("boxed-list")
+        list_box.set_margin_top(0)
+        list_box.set_margin_bottom(12)
+        list_box.set_margin_start(12)
+        list_box.set_margin_end(12)
+
+        self.checkboxes = {}
+
+        all_lists = self.app.get_all_lists()
+        for key in all_lists:
+            row = Adw.ActionRow()
+            row.set_title(key)
+            row.set_subtitle(f"Stand: {last_update}")
+            check = Gtk.CheckButton()
+            check.set_active(key in active_lists)
+            check.set_valign(Gtk.Align.CENTER)
+            row.add_prefix(check)
+            self.checkboxes[key] = check
+            list_box.append(row)
+
+        if os.path.exists(self.app.CUSTOM_FILE):
+            row = Adw.ActionRow()
+            row.set_title("Eigene Einträge (benutzerdefiniert)")
+            row.set_subtitle(f"Stand: {last_update}")
+            check = Gtk.CheckButton()
+            check.set_active("CUSTOM" in active_lists)
+            check.set_valign(Gtk.Align.CENTER)
+            row.add_prefix(check)
+            self.checkboxes["CUSTOM"] = check
+            list_box.append(row)
+
+        scrolled.set_child(list_box)
+        main_box.append(scrolled)
+
+    def on_apply(self, button):
+        selected = [key for key, check in self.checkboxes.items() if check.get_active()]
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            f.write('\n'.join(selected))
+            tmp = f.name
+        run_privileged(f'mv {tmp} {self.app.ACTIVE_LISTS_FILE}')
+        self.close()
+
+
+class ManageUserListsDialog(Adw.Window):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent_window = parent
+        self.app = parent.app
+
+        self.set_title("Eigene Blocklisten verwalten")
+        self.set_default_size(700, 500)
+        self.set_transient_for(parent)
+        self.set_modal(True)
+
+        header = Adw.HeaderBar()
+
+        close_btn = Gtk.Button(label="Schließen")
+        close_btn.connect("clicked", lambda x: self.close())
+        header.pack_start(close_btn)
+
+        add_btn = Gtk.Button(label="Hinzufügen")
+        add_btn.add_css_class("suggested-action")
+        add_btn.connect("clicked", self.on_add_list)
+        header.pack_end(add_btn)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(main_box)
+        self.set_content(toolbar_view)
+
+        info_label = Gtk.Label()
+        info_label.set_markup("<b>Ihre eigenen Blocklisten:</b>")
+        info_label.set_xalign(0)
+        info_label.set_margin_top(12)
+        info_label.set_margin_bottom(12)
+        info_label.set_margin_start(12)
+        info_label.set_margin_end(12)
+        main_box.append(info_label)
+
+        desc_label = Gtk.Label()
+        desc_label.set_markup("<small>Fügen Sie URLs von Blocklisten hinzu (z.B. von GitHub, Pastebin, etc.)</small>")
+        desc_label.set_xalign(0)
+        desc_label.set_margin_bottom(12)
+        desc_label.set_margin_start(12)
+        desc_label.set_margin_end(12)
+        desc_label.add_css_class("dim-label")
+        main_box.append(desc_label)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.add_css_class("boxed-list")
+        self.list_box.set_margin_top(0)
+        self.list_box.set_margin_bottom(12)
+        self.list_box.set_margin_start(12)
+        self.list_box.set_margin_end(12)
+
+        self.refresh_list()
+
+        scrolled.set_child(self.list_box)
+        main_box.append(scrolled)
+
+    def refresh_list(self):
+        """Aktualisiert die Anzeige der Benutzerlisten"""
+        # Bestehende Einträge entfernen
+        for child in self.list_box.observe_children():
+            self.list_box.remove(child)
+
+        if not self.app.user_lists:
+            empty_label = Gtk.Label()
+            empty_label.set_markup("<i>Keine eigenen Blocklisten vorhanden</i>")
+            empty_label.set_margin_top(24)
+            empty_label.set_margin_bottom(24)
+            empty_label.add_css_class("dim-label")
+            self.list_box.append(empty_label)
+            return
+
+        for name, url in self.app.user_lists.items():
+            row = Adw.ActionRow()
+            row.set_title(name)
+            row.set_subtitle(url)
+            
+            delete_btn = Gtk.Button(label="Entfernen")
+            delete_btn.add_css_class("destructive-action")
+            delete_btn.connect("clicked", lambda x, n=name: self.on_delete_list(n))
+            row.add_suffix(delete_btn)
+            
+            self.list_box.append(row)
+
+    def on_add_list(self, button):
+        """Dialog zum Hinzufügen einer neuen Blockliste"""
+        dialog = Adw.AlertDialog(
+            heading="Neue Blockliste hinzufügen",
+            body="Geben Sie einen Namen und die URL der Blockliste ein:"
+        )
+        dialog.add_response("cancel", "Abbrechen")
+        dialog.add_response("add", "Hinzufügen")
+        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("add")
+
+        # Name Eingabe
+        name_entry = Gtk.Entry()
+        name_entry.set_placeholder_text("z.B. Meine Blockliste")
+        name_entry.set_margin_top(12)
+        name_entry.set_margin_bottom(6)
+        name_entry.set_margin_start(12)
+        name_entry.set_margin_end(12)
+        
+        # URL Eingabe
+        url_entry = Gtk.Entry()
+        url_entry.set_placeholder_text("https://example.com/blocklist.txt")
+        url_entry.set_margin_top(6)
+        url_entry.set_margin_bottom(12)
+        url_entry.set_margin_start(12)
+        url_entry.set_margin_end(12)
+        
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content_box.append(name_entry)
+        content_box.append(url_entry)
+        
+        dialog.set_extra_child(content_box)
+        
+        def on_response(d, response):
+            if response == "add":
+                name = name_entry.get_text().strip()
+                url = url_entry.get_text().strip()
+                
+                if not name or not url:
+                    self.parent_window.show_info("Fehler", "Bitte Name und URL eingeben!")
+                    return
+                
+                if not url.startswith(('http://', 'https://')):
+                    self.parent_window.show_info("Fehler", "Bitte eine gültige URL eingeben!")
+                    return
+                
+                if name in self.app.user_lists:
+                    self.parent_window.show_info("Fehler", "Eine Liste mit diesem Namen existiert bereits!")
+                    return
+                
+                self.app.add_user_list(name, url)
+                self.refresh_list()
+                self.parent_window.show_info("Erfolg", f"Blockliste '{name}' wurde hinzugefügt!")
+        
+        dialog.connect("response", on_response)
+        dialog.present(self)
+        GLib.timeout_add(100, lambda: (name_entry.grab_focus(), False)[1])
+
+    def on_delete_list(self, name):
+        """Löscht eine Benutzerliste"""
+        dialog = Adw.AlertDialog(
+            heading="Blockliste entfernen?",
+            body=f"Möchten Sie die Liste '{name}' wirklich entfernen?"
+        )
+        dialog.add_response("cancel", "Abbrechen")
+        dialog.add_response("delete", "Entfernen")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        
+        def on_response(d, response):
+            if response == "delete":
+                self.app.remove_user_list(name)
+                self.refresh_list()
+                self.parent_window.show_info("Erfolg", f"Blockliste '{name}' wurde entfernt!")
+        
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+
+class ManageCustomDialog(Adw.Window):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent_window = parent
+        self.app = parent.app
+
+        self.set_title("Gesperrte Webseiten")
+        self.set_default_size(600, 450)
+        self.set_transient_for(parent)
+        self.set_modal(True)
+
+        header = Adw.HeaderBar()
+
+        close_btn = Gtk.Button(label="Schließen")
+        close_btn.connect("clicked", lambda x: self.close())
+        header.pack_start(close_btn)
+
+        delete_btn = Gtk.Button(label="Ausgewählte freigeben")
+        delete_btn.add_css_class("destructive-action")
+        delete_btn.connect("clicked", self.on_delete)
+        header.pack_end(delete_btn)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(main_box)
+        self.set_content(toolbar_view)
+
+        info_label = Gtk.Label()
+        info_label.set_markup("<b>Ihre gesperrten Webseiten:</b>")
+        info_label.set_xalign(0)
+        info_label.set_margin_top(12)
+        info_label.set_margin_bottom(12)
+        info_label.set_margin_start(12)
+        info_label.set_margin_end(12)
+        main_box.append(info_label)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.add_css_class("boxed-list")
+        self.list_box.set_margin_top(0)
+        self.list_box.set_margin_bottom(12)
+        self.list_box.set_margin_start(12)
+        self.list_box.set_margin_end(12)
+
+        self.checkboxes = {}
+        with open(self.app.CUSTOM_FILE, 'r') as f:
+            for line in f:
+                if line.startswith("0.0.0.0 "):
+                    domain = line.strip().split()[1]
+                    row = Adw.ActionRow()
+                    row.set_title(domain)
+                    check = Gtk.CheckButton()
+                    check.set_valign(Gtk.Align.CENTER)
+                    row.add_prefix(check)
+                    self.checkboxes[domain] = check
+                    self.list_box.append(row)
+
+        scrolled.set_child(self.list_box)
+        main_box.append(scrolled)
+
+    def on_delete(self, button):
+        to_delete = [d for d, c in self.checkboxes.items() if c.get_active()]
+        if not to_delete:
+            return
+
+        dialog = Adw.AlertDialog(
+            heading="Webseiten freigeben?",
+            body=f"{len(to_delete)} Webseite(n) werden wieder freigegeben."
+        )
+        dialog.add_response("cancel", "Abbrechen")
+        dialog.add_response("delete", "Freigeben")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+
+        def on_response(d, response):
+            if response == "delete":
+                self.delete_domains(to_delete)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def delete_domains(self, domains):
+        if os.path.exists(self.app.CUSTOM_FILE):
+            with open(self.app.CUSTOM_FILE, 'r') as f:
+                lines = f.readlines()
+            with open(self.app.CUSTOM_FILE, 'w') as f:
+                for line in lines:
+                    parts = line.strip().split()
+                    if len(parts) > 1 and parts[1] not in domains:
+                        f.write(line)
+
+        for domain in domains:
+            escaped = domain.replace('.', r'\.')
+            run_privileged(f"sed -i '/^0\\.0\\.0\\.0 {escaped}$/d' /etc/hosts")
+            run_privileged(f"sed -i '/^::1 {escaped}$/d' /etc/hosts")
+
+        run_privileged('systemd-resolve --flush-caches 2>/dev/null || resolvectl flush-caches 2>/dev/null || true')
+        self.parent_window.update_custom_count()
+        self.close()
+        count = self.parent_window.count_custom_entries()
+        self.parent_window.show_info(
+            "Webseiten freigegeben ✓",
+            f"Noch gesperrt: {count} Webseiten\n\nBrowser neu starten!"
+        )
+
+
+def main():
+    if os.geteuid() == 0:
+        print("Dieses Skript sollte NICHT als root ausgeführt werden!")
+        print("Es verwendet sudo für privilegierte Operationen.")
+        sys.exit(1)
+    
+    app = AdBlockerApp()
+    return app.run(None)
+
+
+if __name__ == "__main__":
+    main()
