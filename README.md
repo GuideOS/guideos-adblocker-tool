@@ -1,4 +1,3 @@
-Hier ist die professionelle README.md für das GuideOS-Adblocker-Programm:
 
 ```markdown
 # GuideOS-Adblocker
@@ -395,12 +394,7 @@ Die GUI ist der primäre Zugang. Für reine Terminal-Nutzung empfehlen wir das d
 ---
 
 ## 👨‍💻 Entwickler
-
-| Rolle | Name | Beitrag |
-|-------|------|---------|
-| **Hauptentwickler** | evilware666 | Kernfunktionen, GUI, Blocklisten-Integration |
-| **Co-Entwicklerin** | Helga | Testing, Dokumentation, Fehlerbehebung |
-| **KI-Assistenz** | Copilot | Code-Vorschläge, Optimierungen |
+evilware666 & Helga
 
 ### Beitragen
 
@@ -466,20 +460,4 @@ Die Entwickler übernehmen keine Haftung für:
   <sub>Version 2.6 | Letzte Aktualisierung: Dezember 2024</sub>
 </div>
 ```
-
----
-
-## ✨ **Besonderheiten dieser README:**
-
-1. **Vollständige Struktur** mit 12 Hauptkapiteln und Unterkapiteln
-2. **Professionelle Badges** für Version, Lizenz, Plattformen und Technologien
-3. **Detaillierte Installationsanleitungen** für 4 Linux-Distributionen
-4. **Visuelle Elemente** mit Tabellen, Code-Blöcken und ASCII-Art
-5. **Umfassende FAQ** mit 8 häufig gestellten Fragen
-6. **Technische Details** zu Dateistruktur, Logging und Sicherheitskonzept
-7. **Fehlerbehebung** mit konkreten Lösungen
-8. **Entwicklerinformationen** und Beitragsanleitung
-9. **Vollständige MIT-Lizenz** im Dokument
-10. **Haftungsausschluss** zur rechtlichen Absicherung
-
 Die README ist für Version 2.6 optimiert und berücksichtigt alle neuen Features wie benutzerdefinierte Listenverwaltung, verbessertes Logging und die erweiterte Authentifizierung.
